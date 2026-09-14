@@ -23,9 +23,7 @@ class vocoder_processor:
             
             3) shi_out[first column] = shi[first column]
                shi_out[this column] = shi_out[prev column] + inst_freq* Hs 
-
-    
-    
+                
     """
 
     def __init__(
@@ -86,10 +84,11 @@ class vocoder_processor:
 
         return wk_hat
 
-    def calculate_shi_out(self, speed_factor:float):
+    def calculate_shi_out(self, speed_factor:float = 1, pitch_factor:float = 1):
 
         Hs = self.get_synthesis_hop(speed_factor)
         wk_hat = self.calculate_wk_hat()
+        wk_hat = wk_hat*pitch_factor
 
         if(self.stft_matrix is None):
             raise RuntimeError("STFT went wrong")
@@ -119,5 +118,12 @@ class vocoder_processor:
         expected_length = round(expected_duration*self.audio_loader.sample_rate)
         reconstructed_audio = self.stft_processor.istft(stft_out, expected_length, hop_size=self.get_synthesis_hop(speed_factor))
         return reconstructed_audio
+
+    def vocoder_note_shift(self, semitone):
+        """
+            semitone n shift -> freq * 2^(n/12)  shift
+            shift each frame. fix its phase
+            reconstruct with same hop length
+        """
 
 
