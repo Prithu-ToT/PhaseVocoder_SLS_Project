@@ -101,13 +101,13 @@ class vocoder_processor:
 
         return shi_out
 
-    def vocoder_speedup(self, speed_factor:float) -> np.ndarray:
+    def vocoder_process(self, speed_factor:float,pitch_factor:float=1.0) -> np.ndarray:
 
         
         if self.stft_matrix is None:
             self.run_stft()
 
-        shi_out = self.calculate_shi_out(speed_factor)
+        shi_out = self.calculate_shi_out(speed_factor,pitch_factor)
         if self.stft_matrix is None:
             raise RuntimeError("Something went wrong")
         stft_out = np.abs(self.stft_matrix) * np.exp(1j*shi_out)
@@ -118,12 +118,40 @@ class vocoder_processor:
         expected_length = round(expected_duration*self.audio_loader.sample_rate)
         reconstructed_audio = self.stft_processor.istft(stft_out, expected_length, hop_size=self.get_synthesis_hop(speed_factor))
         return reconstructed_audio
-
-    def vocoder_note_shift(self, semitone):
+    
+    def vocoder_note_shift(self, semitone: float) -> np.ndarray:
         """
-            semitone n shift -> freq * 2^(n/12)  shift
-            shift each frame. fix its phase
-            reconstruct with same hop length
-        """
+            semitone n shift -> freq * 2^(n/12) shift
 
+            Pure pitch shift (duration preserved):
+            1. Resample by pitch_ratio -> shifts pitch, changes length.
+            2. Phase-vocoder stretch back to the original length ->
+                this stage changes duration without touching pitch,
+                so the pitch shift from step 1 survives intact.
+        """
+        if self.audio_loader.audio_data is None or self.audio_loader.sample_rate is None:
+            raise RuntimeError("No audio loaded in audio_loader.")
+
+        audio = self.audio_loader.audio_data
+        sr = self.audio_loader.sample_rate
+        n = len(audio)
+
+        pitch_ratio = 2 ** (semitone / 12.0)
+
+        # --- Step 1: resample (shifts pitch, changes length) ---
+        resampled_len = max(1, round(n / pitch_ratio))
+        src_positions = np.linspace(0, n - 1, resampled_len)
+        resampled = np.interp(src_positions, np.arange(n), audio).astype(np.float32)
+
+        # --- Step 2: stretch resampled audio back to original length ---
+        temp_loader = AudioLoader()
+        temp_loader.audio_data = resampled
+        temp_loader.sample_rate = sr
+
+        temp_vocoder = vocoder_processor(temp_loader, self.stft_processor)
+
+        length_correction = resampled_len / n   # brings length back to n
+        pitch_shifted = temp_vocoder.vocoder_process(length_correction, pitch_factor=1.0)
+
+        return pitch_shifted
 
