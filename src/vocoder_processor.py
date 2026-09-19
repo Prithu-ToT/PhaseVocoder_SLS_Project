@@ -7,6 +7,7 @@ import numpy as np
 from audio_loader import AudioLoader
 from stft_processor import STFTProcessor
 
+#added vocoder_note_shift and changed vocoder_speedup to vocoder_process
 
 class vocoder_processor:
     """ Run vocoder processing on audio loaded by an ``AudioLoader``.

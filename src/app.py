@@ -8,7 +8,7 @@ Streamlit dashboard for:
 - Original vs. sped-up waveform visualization
 - Audio playback comparison
 """
-
+#added independent pitch and speed up
 import json
 import os
 import tempfile
