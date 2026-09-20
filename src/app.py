@@ -19,7 +19,7 @@ import streamlit.components.v1 as components
 
 from audio_loader import AudioLoader
 from stft_processor import STFTProcessor
-from milestone_1 import normalize_audio
+from audio_loader import normalize_audio
 from vocoder_processor import vocoder_processor
 
 
