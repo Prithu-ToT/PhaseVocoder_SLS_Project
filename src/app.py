@@ -8,12 +8,14 @@ Streamlit dashboard for:
 - Original vs. sped-up waveform visualization
 - Audio playback comparison
 """
-
+#added independent pitch and speed up
+import json
 import os
 import tempfile
 
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 
 from audio_loader import AudioLoader
 from stft_processor import STFTProcessor
@@ -91,6 +93,28 @@ speed_factor = st.sidebar.slider(
     help=(
         "1.00× = original speed. Greater than 1.00× speeds up the audio. "
         "Less than 1.00× slows it down."
+    ),
+)
+
+pitch_semitones = st.sidebar.slider(
+    "Pitch Shift (semitones)",
+    min_value=-12.0, max_value=12.0, value=0.0, step=0.5,
+)
+pitch_factor = 2 ** (pitch_semitones / 12.0)
+
+pitch_method = st.sidebar.radio(
+    "Pitch Shift Method",
+    options=["Fast (phase-warp)", "Accurate (resample + restretch)"],
+    index=0,
+    help=(
+        "**Fast**: scales the phase-advance rate directly inside the "
+        "same STFT/ISTFT pass used for speed (`vocoder_process`). "
+        "Cheap — one pass — but a phase-domain approximation; can "
+        "sound slightly smeared at larger shifts.\n\n"
+        "**Accurate**: resamples the audio by the pitch ratio, then "
+        "phase-vocoder stretches it back to the target duration "
+        "(`vocoder_note_shift`). Two passes, but avoids the phase "
+        "approximation and generally sounds cleaner."
     ),
 )
 
@@ -249,9 +273,44 @@ if audio_path:
                     stft_processor=processor,
                 )
 
-                sped_up_audio = vocoder.vocoder_speedup(
-                    speed_factor
-                )
+                if pitch_method == "Fast (phase-warp)":
+
+                    # Single pass: speed + pitch both handled inside the
+                    # same phase-accumulation step (calculate_shi_out).
+                    sped_up_audio = vocoder.vocoder_process(
+                        speed_factor, pitch_factor
+                    )
+
+                else:  # "Accurate (resample + restretch)"
+
+                    # Step 1: pure time-stretch to the target speed
+                    # (pitch untouched at this stage).
+                    stretched_audio = vocoder.vocoder_process(
+                        speed_factor, pitch_factor=1.0
+                    )
+
+                    if pitch_semitones != 0:
+
+                        # Step 2: apply the true pitch shift on top of
+                        # the already-stretched audio, preserving its
+                        # (speed-adjusted) duration.
+                        stretched_loader = AudioLoader()
+                        stretched_loader.audio_data = stretched_audio.astype(
+                            np.float32
+                        )
+                        stretched_loader.sample_rate = sr
+
+                        stretched_vocoder = vocoder_processor(
+                            stretched_loader, processor
+                        )
+
+                        sped_up_audio = stretched_vocoder.vocoder_note_shift(
+                            pitch_semitones
+                        )
+
+                    else:
+
+                        sped_up_audio = stretched_audio
 
                 sped_up_audio = normalize_audio(
                     sped_up_audio
@@ -321,37 +380,95 @@ if audio_path:
                 ]
 
                 # ----------------------------------------------------------
-                # Original waveform
+                # Original + Phase-vocoder waveforms — stacked vertically,
+                # sharing one horizontally-scrollable container so a single
+                # scrollbar pans both charts in sync.
                 # ----------------------------------------------------------
 
-                wave_col1, wave_col2 = st.columns(2)
+                # Pixels-per-sample used to size the inner (scrollable)
+                # width. Below this the charts just fit the viewport with
+                # no scrollbar; above it, both charts grow together and
+                # share one horizontal scrollbar.
+                PIXELS_PER_POINT = 1.4
+                MIN_CHART_WIDTH = 900
 
-                with wave_col1:
+                chart_width = max(
+                    MIN_CHART_WIDTH,
+                    int(max(len(original_ds), len(sped_up_ds)) * PIXELS_PER_POINT),
+                )
 
-                    st.write("**Original Signal**")
+                waveform_html = f"""
+                <div style="
+                    overflow-x:auto;
+                    overflow-y:hidden;
+                    border:1px solid rgba(250,250,250,0.15);
+                    border-radius:10px;
+                    padding:20px 0 12px 0;
+                    background:transparent;
+                ">
+                  <div style="width:{chart_width}px;">
+                    <div style="margin:0 0 12px 16px; color:#fafafa;
+                                font-weight:600; font-size:15px;">
+                      Original Signal
+                    </div>
+                    <canvas id="origWaveChart" width="{chart_width}" height="260"></canvas>
 
-                    st.line_chart(
-                        {
-                            "Original Signal": original_ds
-                        }
-                    )
+                    <div style="margin:48px 0 12px 16px; color:#fafafa;
+                                font-weight:600; font-size:15px;">
+                      Phase-Vocoder Output ({speed_factor:.2f}&times;)
+                    </div>
+                    <canvas id="vocWaveChart" width="{chart_width}" height="260"></canvas>
+                  </div>
+                </div>
 
-                # ----------------------------------------------------------
-                # Phase-vocoder waveform
-                # ----------------------------------------------------------
+                <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+                <script>
+                (function() {{
+                    const origData = {json.dumps(original_ds.tolist())};
+                    const vocData = {json.dumps(sped_up_ds.tolist())};
 
-                with wave_col2:
+                    function buildChart(canvasId, data, color) {{
+                        const ctx = document.getElementById(canvasId).getContext('2d');
+                        return new Chart(ctx, {{
+                            type: 'line',
+                            data: {{
+                                labels: data.map((_, i) => i),
+                                datasets: [{{
+                                    data: data,
+                                    borderColor: color,
+                                    backgroundColor: color,
+                                    borderWidth: 1,
+                                    pointRadius: 0,
+                                    tension: 0,
+                                    fill: false,
+                                }}],
+                            }},
+                            options: {{
+                                responsive: false,
+                                animation: false,
+                                interaction: {{ mode: 'index', intersect: false }},
+                                plugins: {{ legend: {{ display: false }} }},
+                                scales: {{
+                                    x: {{
+                                        ticks: {{ color: '#9aa0a6', maxTicksLimit: 12 }},
+                                        grid: {{ color: 'rgba(255,255,255,0.08)' }},
+                                    }},
+                                    y: {{
+                                        ticks: {{ color: '#9aa0a6' }},
+                                        grid: {{ color: 'rgba(255,255,255,0.08)' }},
+                                    }},
+                                }},
+                            }},
+                        }});
+                    }}
 
-                    st.write(
-                        f"**Phase-Vocoder Output "
-                        f"({speed_factor:.2f}×)**"
-                    )
+                    buildChart('origWaveChart', origData, '#7cc4fa');
+                    buildChart('vocWaveChart', vocData, '#7cc4fa');
+                }})();
+                </script>
+                """
 
-                    st.line_chart(
-                        {
-                            "Sped-up Signal": sped_up_ds
-                        }
-                    )
+                components.html(waveform_html, height=680, scrolling=False)
 
                 # ----------------------------------------------------------
                 # Reconstruction error
@@ -414,7 +531,7 @@ if audio_path:
                     speed_factor
                 )
 
-                info_col1, info_col2, info_col3 = st.columns(3)
+                info_col1, info_col2, info_col3, info_col4 = st.columns(4)
 
                 info_col1.metric(
                     "Analysis Hop (Ha)",
@@ -430,6 +547,14 @@ if audio_path:
                     "Speed Factor",
                     f"{speed_factor:.2f}×",
                 )
+
+                info_col4.metric(
+                    "Pitch Shift",
+                    f"{pitch_semitones:+.1f} st",
+                    help=f"Frequency multiplier: {pitch_factor:.3f}× · Method: {pitch_method}",
+                )
+
+                st.caption(f"Pitch method used: **{pitch_method}**")
 
             except Exception as e:
 

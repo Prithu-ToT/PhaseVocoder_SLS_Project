@@ -1,0 +1,6 @@
+streamlit
+numpy
+soundfile
+
+# Optional: enables local audio playback in milestone_1.py's __main__ block
+sounddevice
