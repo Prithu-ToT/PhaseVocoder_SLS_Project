@@ -24,6 +24,10 @@ class vocoder_processor:
             
             3) shi_out[first column] = shi[first column]
                shi_out[this column] = shi_out[prev column] + inst_freq* Hs 
+
+            4) vocoder_process mainly processes time, can process fast small pitch shift
+            
+            5) vocoder_accurate_process does resampling to change pitch, then stretches audio back
                 
     """
 
@@ -35,7 +39,6 @@ class vocoder_processor:
         self.audio_loader = audio_loader
         self.stft_processor = stft_processor
         self.stft_matrix: np.ndarray | None = None
-        self.run_stft()
 
     def run_stft(self) -> np.ndarray:
         """Compute and store the STFT matrix for the loaded audio."""
@@ -64,8 +67,11 @@ class vocoder_processor:
         """
 
         if(self.stft_matrix is None):
-            raise RuntimeError("Audio was not stft-ed")
-        
+            self.run_stft()
+
+        if(self.stft_matrix is None):
+            raise RuntimeError("run_stft returned none")
+                
         shi = np.angle(self.stft_matrix)
         sub_shi = np.roll(a=shi, shift=1, axis=1)
         sub_shi[:,0] = 0
@@ -103,7 +109,6 @@ class vocoder_processor:
         return shi_out
 
     def vocoder_process(self, speed_factor:float,pitch_factor:float=1.0) -> np.ndarray:
-
         
         if self.stft_matrix is None:
             self.run_stft()
@@ -119,8 +124,31 @@ class vocoder_processor:
         expected_length = round(expected_duration*self.audio_loader.sample_rate)
         reconstructed_audio = self.stft_processor.istft(stft_out, expected_length, hop_size=self.get_synthesis_hop(speed_factor))
         return reconstructed_audio
+
+    def get_resampled_audioloader(self, duration_factor : float) -> AudioLoader:
+        """
+            returns an audio with new_duration = duration * duration_factor
+        """
+
+        if self.audio_loader.audio_data is None or self.audio_loader.sample_rate is None:
+                    raise RuntimeError("No audio loaded in audio_loader.")
+
+        audio = self.audio_loader.audio_data
+        sr = self.audio_loader.sample_rate
+        n = len(audio)
+
+        resampled_len = max(1, round(n*duration_factor))
+        src_positions = np.linspace(0, n - 1, resampled_len)
+        resampled = np.interp(src_positions, np.arange(n), audio).astype(np.float32)
+
+        resampled_loader = AudioLoader()
+        resampled_loader.audio_data = resampled 
+        resampled_loader.sample_rate = sr
+
+        return resampled_loader
+        
     
-    def vocoder_note_shift(self, semitone: float) -> np.ndarray:
+    def vocoder_accurate_process(self, speed_factor:float, semitone_shift: float) -> np.ndarray:
         """
             semitone n shift -> freq * 2^(n/12) shift
 
@@ -133,26 +161,18 @@ class vocoder_processor:
         if self.audio_loader.audio_data is None or self.audio_loader.sample_rate is None:
             raise RuntimeError("No audio loaded in audio_loader.")
 
-        audio = self.audio_loader.audio_data
-        sr = self.audio_loader.sample_rate
-        n = len(audio)
+        if semitone_shift == 0:
+            return self.vocoder_process(speed_factor)
 
-        pitch_ratio = 2 ** (semitone / 12.0)
+        pitch_time_stretch = 2 ** (-semitone_shift / 12.0)
+        resampled_audioloader = self.get_resampled_audioloader(pitch_time_stretch)
 
-        # --- Step 1: resample (shifts pitch, changes length) ---
-        resampled_len = max(1, round(n / pitch_ratio))
-        src_positions = np.linspace(0, n - 1, resampled_len)
-        resampled = np.interp(src_positions, np.arange(n), audio).astype(np.float32)
+        true_speed_factor = pitch_time_stretch * speed_factor    # resampling stretches time, speed factor quickens
+        if abs(true_speed_factor-1) < 1e-5:
+            return resampled_audioloader.audio_data
 
-        # --- Step 2: stretch resampled audio back to original length ---
-        temp_loader = AudioLoader()
-        temp_loader.audio_data = resampled
-        temp_loader.sample_rate = sr
-
-        temp_vocoder = vocoder_processor(temp_loader, self.stft_processor)
-
-        length_correction = resampled_len / n   # brings length back to n
-        pitch_shifted = temp_vocoder.vocoder_process(length_correction, pitch_factor=1.0)
+        time_vocoder = vocoder_processor(resampled_audioloader, self.stft_processor)
+        pitch_shifted = time_vocoder.vocoder_process(true_speed_factor, pitch_factor=1.0)
 
         return pitch_shifted
 

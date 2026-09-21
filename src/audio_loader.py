@@ -24,6 +24,44 @@ if TYPE_CHECKING:
     from matplotlib.axes import Axes
 
 
+def normalize_audio(audio: np.ndarray) -> np.ndarray:
+    """Peak-normalize an audio signal to the range [-1.0, 1.0].
+
+    The function finds the maximum absolute sample value and scales the
+    entire waveform so that the loudest peak sits at ±1.0.  A small
+    headroom factor (0.99) is applied to prevent floating-point rounding
+    from nudging any sample above 1.0 — which would cause hard clipping
+    in most playback pipelines and DACs.
+
+    If the signal is completely silent (all zeros), it is returned as-is
+    to avoid division by zero.
+
+    Parameters
+    ----------
+    audio : np.ndarray
+        1-D real array of arbitrary amplitude range.
+
+    Returns
+    -------
+    normalized : np.ndarray
+        1-D float32 array scaled so that
+        ``max(abs(normalized)) ≈ 0.99``.
+    """
+    # Find the peak absolute value across the entire signal
+    peak: float = float(np.max(np.abs(audio)))
+
+    if peak < 1e-10:
+        # Signal is essentially silent — nothing to scale.
+        return audio.astype(np.float32)
+
+    # Headroom factor keeps us safely below the ±1.0 clipping boundary.
+    headroom: float = 0.99
+
+    normalized: np.ndarray = (audio / peak) * headroom
+
+    return normalized.astype(np.float32)
+
+
 class AudioLoader:
     """Loads an audio file from disk into a mono float32 numpy array.
 
