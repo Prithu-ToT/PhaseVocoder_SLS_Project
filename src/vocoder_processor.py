@@ -161,12 +161,17 @@ class vocoder_processor:
         if self.audio_loader.audio_data is None or self.audio_loader.sample_rate is None:
             raise RuntimeError("No audio loaded in audio_loader.")
 
+        if semitone_shift == 0:
+            return self.vocoder_process(speed_factor)
+
         pitch_time_stretch = 2 ** (-semitone_shift / 12.0)
         resampled_audioloader = self.get_resampled_audioloader(pitch_time_stretch)
-        
-        time_vocoder = vocoder_processor(resampled_audioloader, self.stft_processor)
 
         true_speed_factor = pitch_time_stretch * speed_factor    # resampling stretches time, speed factor quickens
+        if abs(true_speed_factor-1) < 1e-5:
+            return resampled_audioloader.audio_data
+
+        time_vocoder = vocoder_processor(resampled_audioloader, self.stft_processor)
         pitch_shifted = time_vocoder.vocoder_process(true_speed_factor, pitch_factor=1.0)
 
         return pitch_shifted
