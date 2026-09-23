@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import soundfile as sf
+from pathlib import Path
 
 if TYPE_CHECKING:
     # Only needed for static type checking (Pylance/pyright). matplotlib
@@ -172,6 +173,56 @@ class AudioLoader:
         if audio_data is None or not sample_rate:
             return 0.0
         return len(audio_data) / sample_rate
+
+    def unload(self) -> str:
+        """Write the loaded audio data to a WAV file.
+
+        The output file is created in the same directory as the input file
+        with "_output" appended to its filename.
+
+        Example
+        -------
+        input:
+            "music/song.mp3"
+
+        output:
+            "music/song_output.wav"
+
+        Returns
+        -------
+        str
+            Path of the generated WAV file.
+
+        Raises
+        ------
+        RuntimeError
+            If no audio has been loaded yet.
+        """
+        audio_data = self.audio_data
+        sample_rate = self.sample_rate
+        file_path = self.file_path
+
+        if audio_data is None or sample_rate is None or file_path is None:
+            raise RuntimeError(
+                "No audio loaded yet — call `load(file_path)` "
+                "or pass `file_path` to the constructor first."
+            )
+
+        input_path = Path(file_path)
+
+        output_path = input_path.with_name(
+            f"{input_path.stem}_output.wav"
+        )
+
+        sf.write(
+            output_path,
+            audio_data,
+            sample_rate,
+            subtype="PCM_16",
+        )
+
+        return str(output_path)
+
 
     # ------------------------------------------------------------------
     # Plotting
