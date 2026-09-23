@@ -27,9 +27,17 @@ class vocoder_processor:
             shi_out[this column] = shi_out[prev column] + inst_freq* Hs 
 
             4) vocoder_process mainly processes time, can process fast small pitch shift
-            
-            5) vocoder_accurate_process does resampling to change pitch, then stretches audio back
-                
+
+        Note: the multi-stage "resample, then stretch back to compensate"
+        recipe for accurate pitch shifting (formerly `vocoder_accurate_
+        process` on this class) now lives on `VocoderOrchestrator`
+        (vocoder_orchestrator.py) — deciding when to resample, when a
+        stage can be skipped, and when to persist a result to disk are
+        workflow decisions, not phase-vocoder signal processing. This
+        class stays focused on STFT / phase-vocoder / ISTFT and on
+        `get_resampled_audioloader`, a thin resampling passthrough used
+        both by the orchestrator's recipe and by the UI's standalone
+        naive-resample comparison. See orchastration.md.
     """
 
     def __init__(
@@ -146,35 +154,4 @@ class vocoder_processor:
         
         resampler = Resampler(self.audio_loader, duration_factor)
         return resampler.get_resampled_audio()
-        
-    
-    def vocoder_accurate_process(self, speed_factor:float, semitone_shift: float) -> np.ndarray:
-        """
-            semitone n shift -> freq * 2^(n/12) shift
-
-            Pure pitch shift (duration preserved):
-            1. Resample by pitch_ratio -> shifts pitch, changes length.
-            2. Phase-vocoder stretch back to the original length ->
-                this stage changes duration without touching pitch,
-                so the pitch shift from step 1 survives intact.
-        """
-        if self.audio_loader.audio_data is None or self.audio_loader.sample_rate is None:
-            raise RuntimeError("No audio loaded in audio_loader.")
-
-        if semitone_shift == 0:
-            return self.vocoder_process(speed_factor)
-
-        pitch_time_stretch = 2 ** (-semitone_shift / 12.0)
-        resampled_audioloader = self.get_resampled_audioloader(pitch_time_stretch)
-
-        true_speed_factor = pitch_time_stretch * speed_factor    # resampling stretches time, speed factor quickens
-        if abs(true_speed_factor-1) < 1e-5:
-            return resampled_audioloader.audio_data
-
-        time_vocoder = vocoder_processor(resampled_audioloader, self.stft_processor)
-        pitch_shifted = time_vocoder.vocoder_process(true_speed_factor, pitch_factor=1.0)
-
-
-
-        return pitch_shifted
 

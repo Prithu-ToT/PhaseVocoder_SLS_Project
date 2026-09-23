@@ -4,14 +4,18 @@ app.py – Phase Vocoder Studio (Streamlit front end)
 Time-stretch and pitch-shift audio through a custom STFT phase vocoder.
 
 Architecture used here:
-    - `AudioLoader`        (audio_loader.py)      – file I/O + normalize_audio
-    - `STFTProcessor`      (stft_processor.py)     – STFT / ISTFT, windowing
-    - `vocoder_processor`  (vocoder_processor.py)  – phase-vocoder pipeline
+    - `AudioLoader`          (audio_loader.py)          – file I/O + normalize_audio
+    - `STFTProcessor`        (stft_processor.py)        – STFT / ISTFT, windowing
+    - `VocoderOrchestrator`  (vocoder_orchestrator.py)  – workflow: picks/coordinates
+      the processing pipeline (fast phase-manipulation vs. accurate resample+stretch,
+      naive-resample comparison) and persists the accurate-mode result to disk.
+      See architecture.md / orchastration.md for the full rationale.
 
 Dispatch rule (per project owner): the "Pitch-Shift Mode" toggle alone
-decides which vocoder path runs — Fast always calls `vocoder_process`,
-Accurate always calls `vocoder_accurate_process` — regardless of whether
-the semitone shift is 0.
+decides which vocoder path runs — Fast always calls
+`orchestrator.vocoder_process`, Accurate always calls
+`orchestrator.process_and_write` — regardless of whether the semitone
+shift is 0.
 """
 
 import base64
@@ -27,7 +31,7 @@ import streamlit.components.v1 as components
 
 from audio_loader import AudioLoader, normalize_audio
 from stft_processor import STFTProcessor
-from vocoder_processor import vocoder_processor
+from vocoder_orchestrator import VocoderOrchestrator
 
 # Fast mode (vocoder_process) rotates STFT phase directly to shift pitch.
 # Past a few semitones this smears energy across neighboring frequency
@@ -444,14 +448,18 @@ if process_clicked and audio_path:
             sr = loader.sample_rate
 
             stft_processor = STFTProcessor(frame_size=frame_size, hop_size=hop_size)
-            vp = vocoder_processor(loader, stft_processor)
+            orchestrator = VocoderOrchestrator(loader, stft_processor)
 
             # Dispatch purely on the selected mode, regardless of semitone value.
             if is_fast:
                 pitch_factor = 2.0 ** (semitone_shift / 12.0)
-                reconstructed = vp.vocoder_process(speed_factor, pitch_factor=pitch_factor)
+                reconstructed = orchestrator.vocoder_process(speed_factor, pitch_factor=pitch_factor)
             else:
-                reconstructed = vp.vocoder_accurate_process(speed_factor, semitone_shift)
+                # Accurate mode also writes the result to disk (via
+                # AudioLoader.unload(), next to the input file) as a side
+                # effect — no UI change, this is an internal persistence
+                # step of the orchestration workflow.
+                reconstructed = orchestrator.process_and_write(speed_factor, semitone_shift)
 
             output = normalize_audio(reconstructed)
 
@@ -461,7 +469,7 @@ if process_clicked and audio_path:
                 # correction, so pitch shifts along with speed. This is the
                 # contrast case: same duration change, no pitch preservation.
                 duration_factor = 1.0 / speed_factor
-                naive_loader = vp.get_resampled_audioloader(duration_factor)
+                naive_loader = orchestrator.get_resampled_audioloader(duration_factor)
                 naive_output = normalize_audio(naive_loader.audio_data)
 
             st.markdown('<div class="pv-section-title">Results</div>', unsafe_allow_html=True)
