@@ -182,19 +182,23 @@ class AudioLoader:
             return 0.0
         return len(audio_data) / sample_rate
 
-    def unload(self) -> str:
+    def unload(self, output_path: str | None = None) -> str:
         """Write the loaded audio data to a WAV file.
 
-        The output file is created in the same directory as the input file
-        with "_output" appended to its filename.
+        Parameters
+        ----------
+        output_path : str, optional
+            Where to write the WAV file. If omitted, the output file is
+            derived from the loaded input file's path: created in the same
+            directory, with "_output" appended to its filename.
 
-        Example
-        -------
-        input:
-            "music/song.mp3"
+            Example
+            -------
+            input:
+                "music/song.mp3"
 
-        output:
-            "music/song_output.wav"
+            derived output:
+                "music/song_output.wav"
 
         Returns
         -------
@@ -204,32 +208,40 @@ class AudioLoader:
         Raises
         ------
         RuntimeError
-            If no audio has been loaded yet.
+            If no audio has been loaded yet, or if `output_path` is omitted
+            and no `file_path` is set on this instance to derive one from.
         """
         audio_data = self.audio_data
         sample_rate = self.sample_rate
         file_path = self.file_path
 
-        if audio_data is None or sample_rate is None or file_path is None:
+        if audio_data is None or sample_rate is None:
             raise RuntimeError(
                 "No audio loaded yet — call `load(file_path)` "
                 "or pass `file_path` to the constructor first."
             )
 
-        input_path = Path(file_path)
-
-        output_path = input_path.with_name(
-            f"{input_path.stem}_output.wav"
-        )
+        if output_path is not None:
+            final_output_path = Path(output_path)
+        else:
+            if file_path is None:
+                raise RuntimeError(
+                    "No output_path given and no file_path is set on this "
+                    "AudioLoader to derive one from."
+                )
+            input_path = Path(file_path)
+            final_output_path = input_path.with_name(
+                f"{input_path.stem}_output.wav"
+            )
 
         sf.write(
-            output_path,
+            final_output_path,
             audio_data,
             sample_rate,
             subtype="PCM_16",
         )
 
-        return str(output_path)
+        return str(final_output_path)
 
 
     # ------------------------------------------------------------------
