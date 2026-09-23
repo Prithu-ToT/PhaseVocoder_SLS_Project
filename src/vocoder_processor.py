@@ -6,6 +6,7 @@ import numpy as np
 
 from audio_loader import AudioLoader
 from stft_processor import STFTProcessor
+from lanczos_resampler import Resampler
 
 #added vocoder_note_shift and changed vocoder_speedup to vocoder_process
 
@@ -23,7 +24,7 @@ class vocoder_processor:
                 delta is zero is frequency perfectly lines up with bin
             
             3) shi_out[first column] = shi[first column]
-               shi_out[this column] = shi_out[prev column] + inst_freq* Hs 
+            shi_out[this column] = shi_out[prev column] + inst_freq* Hs 
 
             4) vocoder_process mainly processes time, can process fast small pitch shift
             
@@ -54,8 +55,8 @@ class vocoder_processor:
         if speedup_factor <= 0:
             raise ValueError("Speed factor should be positive")
 
-        if speedup_factor < 0.20 or speedup_factor > 2.5:
-            raise ValueError("Speed factor should be inside 0.20 < sf < 2.5 range")
+        if speedup_factor < 0.25 or speedup_factor > 3  :
+            raise ValueError("Speed factor should be inside 0.25 < sf < 2.5 range")
         
         return  round(self.stft_processor.hop_size / speedup_factor)
 
@@ -81,7 +82,7 @@ class vocoder_processor:
         Ha = self.stft_processor.hop_size
 
         #wk for each bin
-        k = np.arange(N//2 + 1)[:, None] #2D by shape [ [k0], [k1], ... ] ready for broadcast to [ [k0, k0....], ...]
+        k = np.arange(N//2 + 1)[:, None] #2D by shape [ [k0], [k1], ..., [k_N/2]] ready for broadcast to [ [k0, k0....], ...]
         wk = 2*np.pi*k/N
 
         delta = del_shi - wk*Ha
@@ -133,19 +134,9 @@ class vocoder_processor:
         if self.audio_loader.audio_data is None or self.audio_loader.sample_rate is None:
                     raise RuntimeError("No audio loaded in audio_loader.")
 
-        audio = self.audio_loader.audio_data
-        sr = self.audio_loader.sample_rate
-        n = len(audio)
-
-        resampled_len = max(1, round(n*duration_factor))
-        src_positions = np.linspace(0, n - 1, resampled_len)
-        resampled = np.interp(src_positions, np.arange(n), audio).astype(np.float32)
-
-        resampled_loader = AudioLoader()
-        resampled_loader.audio_data = resampled 
-        resampled_loader.sample_rate = sr
-
-        return resampled_loader
+        
+        resampler = Resampler(self.audio_loader, duration_factor)
+        return resampler.get_resampled_audio()
         
     
     def vocoder_accurate_process(self, speed_factor:float, semitone_shift: float) -> np.ndarray:
@@ -173,6 +164,8 @@ class vocoder_processor:
 
         time_vocoder = vocoder_processor(resampled_audioloader, self.stft_processor)
         pitch_shifted = time_vocoder.vocoder_process(true_speed_factor, pitch_factor=1.0)
+
+
 
         return pitch_shifted
 
