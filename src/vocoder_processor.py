@@ -55,8 +55,8 @@ class vocoder_processor:
         if speedup_factor <= 0:
             raise ValueError("Speed factor should be positive")
 
-        if speedup_factor < 0.25 or speedup_factor > 3  :
-            raise ValueError("Speed factor should be inside 0.25 < sf < 2.5 range")
+        if speedup_factor < 0.25 or speedup_factor > 3:
+            raise ValueError("Speed factor should be inside 0.25 < sf < 3 range")
         
         return  round(self.stft_processor.hop_size / speedup_factor)
 
@@ -87,8 +87,13 @@ class vocoder_processor:
 
         delta = del_shi - wk*Ha
         #unwrap logic, add +pi to make it non-negative, modulo 2pi makes it bound and then -pi to get back
-        delta = (delta + np.pi) % (2*np.pi) - np.pi
-        wk_hat = wk + delta/Ha
+        # Done in place (delta isn't needed in its pre-wrap form again) so
+        # this is 0 extra full-size (bins x frames) allocations instead of 3.
+        delta += np.pi
+        delta %= (2*np.pi)
+        delta -= np.pi
+        delta /= Ha
+        wk_hat = wk + delta
 
         return wk_hat
 
@@ -96,14 +101,18 @@ class vocoder_processor:
 
         Hs = self.get_synthesis_hop(speed_factor)
         wk_hat = self.calculate_wk_hat()
-        wk_hat = wk_hat*pitch_factor
+        if pitch_factor != 1.0:
+            wk_hat = wk_hat*pitch_factor
 
         if(self.stft_matrix is None):
             raise RuntimeError("STFT went wrong")
 
-        shi_in = np.angle(self.stft_matrix)
-        shi_out = np.zeros_like(self.stft_matrix, dtype=float) 
-        shi_out[:,0] = shi_in[:, 0]
+        shi_out = np.zeros_like(self.stft_matrix, dtype=float)
+        # Only the first column's phase is actually used below, so take the
+        # angle of that one column instead of np.angle() over the whole
+        # (bins x frames) matrix — calculate_wk_hat() above already did that
+        # full-size computation once; no need to redo it here for one column.
+        shi_out[:,0] = np.angle(self.stft_matrix[:, 0])
         for frame in range(1, shi_out.shape[1]):
             shi_out[:, frame] = shi_out[:, frame-1] + wk_hat[:, frame]*Hs
 

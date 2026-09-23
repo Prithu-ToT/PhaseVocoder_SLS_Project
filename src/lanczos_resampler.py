@@ -119,7 +119,9 @@ class Resampler:
 
         # Which of those indices actually fall inside the source
         valid = (indices >= 0) & (indices < self.src.num_samples)
-        indices = np.clip(indices, 0, self.src.num_samples - 1)
+        # out=indices reuses the buffer we already own instead of
+        # allocating a second (chunk, taps) int array just to clip it.
+        np.clip(indices, 0, self.src.num_samples - 1, out=indices)
 
         # Lanczos interpolation weights
         distances = x[:, None] - indices

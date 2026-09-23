@@ -224,6 +224,18 @@ PX_PER_SECOND = 120     # shared time scale so waveform & spectrogram widths lin
 MIN_PLOT_WIDTH = 900
 MAX_PLOT_WIDTH = 12000
 
+# A spectrogram is a raster, not an SVG polyline like the waveform: imshow
+# colorizes the *entire* data array to RGBA before it's ever downsampled to
+# the figure's pixel size. At MAX_PLOT_WIDTH-scale widths on a long clip
+# that colorization step alone can try to allocate multiple GB (this is
+# what was crashing render_spectrogram_card — see traceback: a 2.5 GiB
+# float64 (1025, 81895, 4) RGBA array). Cap the spectrogram narrower than
+# the waveform and downsample the magnitude array itself before it reaches
+# imshow (same idea as the waveform's own step-slicing below).
+SPECTROGRAM_MAX_WIDTH_PX = 2400
+SPECTROGRAM_MAX_TIME_BINS = 2000
+SPECTROGRAM_HEIGHT_PX = 260
+
 
 def _plot_width(duration: float) -> int:
     return int(max(MIN_PLOT_WIDTH, min(MAX_PLOT_WIDTH, duration * PX_PER_SECOND)))
@@ -245,8 +257,14 @@ def render_legend(items: list[tuple[str, str]]) -> None:
     st.markdown(f'<div style="margin:0.1rem 0 0.9rem 0;">{swatches}</div>', unsafe_allow_html=True)
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
 def _waveform_svg(samples: np.ndarray, sample_rate: int, color: str) -> tuple[str, int]:
-    """Build a horizontally-scrollable SVG waveform. Returns (svg_markup, width)."""
+    """Build a horizontally-scrollable SVG waveform. Returns (svg_markup, width).
+
+    Cached (pure function of its args) so re-running the Streamlit script —
+    which happens on every widget interaction — doesn't rebuild the same
+    SVG for the same clip/color each time.
+    """
     n = len(samples)
     height = 160
     mid = height / 2
@@ -259,7 +277,11 @@ def _waveform_svg(samples: np.ndarray, sample_rate: int, color: str) -> tuple[st
 
     target_points = 4000
     step = max(1, n // target_points)
-    pts = samples[::step].astype(np.float64)
+    # `samples[::step]` is already a view, not a copy. The old `.astype
+    # (np.float64)` here turned that view into a full float64 copy for no
+    # reason — SVG coordinates are formatted to 1 decimal place anyway, so
+    # plain float32 (or whatever dtype `samples` already is) is plenty.
+    pts = samples[::step]
 
     peak = max(1e-6, float(np.max(np.abs(pts))))
     xs = np.linspace(0, width, num=len(pts))
@@ -310,6 +332,73 @@ def render_waveform_card(title: str, samples: np.ndarray, sample_rate: int, colo
     components.html(block, height=200, scrolling=False)
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
+def _compute_spectrogram_png(
+    samples: np.ndarray,
+    sample_rate: int,
+    spec_frame_size: int,
+    spec_hop_size: int,
+    width_px: int,
+    duration: float,
+    tick_step: float,
+) -> bytes:
+    """Compute the spectrogram PNG bytes for one clip/settings combination.
+
+    Cached so re-running the Streamlit script (any widget interaction reruns
+    the whole file top to bottom) doesn't redo this allocation-heavy work —
+    and since only the small PNG bytes are kept in the cache, the large
+    intermediate arrays (stft_matrix, mag_db) are freed right after this
+    function returns instead of lingering in memory across reruns.
+    """
+    spec_processor = STFTProcessor(frame_size=spec_frame_size, hop_size=spec_hop_size)
+    stft_matrix = spec_processor.stft(samples)
+
+    # float32 halves what the imshow colorization step below has to hold —
+    # dB magnitude values don't need float64 precision to look right on a
+    # plot.
+    mag_db = (20 * np.log10(np.abs(stft_matrix) + 1e-10)).astype(np.float32)
+    extent_duration = stft_matrix.shape[1] * spec_hop_size / sample_rate
+
+    # imshow colorizes the FULL array to RGBA before it's ever resampled
+    # down to the figure's actual pixel size — on a long clip (tens of
+    # thousands of frames) that colorization step alone can try to
+    # allocate multiple GB, which is what was crashing this function (see
+    # module-level comment above SPECTROGRAM_MAX_WIDTH_PX). Downsample the
+    # time axis ourselves first, the same way the waveform plot already
+    # strides down to ~4000 points in `_waveform_svg` above.
+    time_bins = mag_db.shape[1]
+    target_bins = min(time_bins, SPECTROGRAM_MAX_TIME_BINS, width_px)
+    step = max(1, time_bins // target_bins)
+    if step > 1:
+        mag_db = mag_db[:, ::step]
+
+    dpi = 100
+
+    fig, ax = plt.subplots(
+        figsize=(width_px / dpi, SPECTROGRAM_HEIGHT_PX / dpi), dpi=dpi
+    )
+    ax.imshow(
+        mag_db,
+        origin="lower",
+        aspect="auto",
+        extent=[0, extent_duration, 0, sample_rate / 2],
+        cmap="magma",
+    )
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Frequency (Hz)")
+
+    ticks = np.arange(0, duration + 1e-9, tick_step)
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([f"{int(round(t))}" for t in ticks])
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 def render_spectrogram_card(
     title: str, samples: np.ndarray, sample_rate: int, spec_frame_size: int, spec_hop_size: int
 ) -> None:
@@ -320,37 +409,14 @@ def render_spectrogram_card(
         st.caption(f"{title}: clip too short to compute a spectrogram at this frame size.")
         return
 
-    spec_processor = STFTProcessor(frame_size=spec_frame_size, hop_size=spec_hop_size)
-    stft_matrix = spec_processor.stft(samples)
-    mag_db = 20 * np.log10(np.abs(stft_matrix) + 1e-10)
-
     duration = len(samples) / sample_rate
-    width_px = _plot_width(duration)
-    height_px = 260
-    dpi = 100
-
-    fig, ax = plt.subplots(figsize=(width_px / dpi, height_px / dpi), dpi=dpi)
-    ax.imshow(
-        mag_db,
-        origin="lower",
-        aspect="auto",
-        extent=[0, stft_matrix.shape[1] * spec_hop_size / sample_rate, 0, sample_rate / 2],
-        cmap="magma",
-    )
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Frequency (Hz)")
-
+    width_px = min(_plot_width(duration), SPECTROGRAM_MAX_WIDTH_PX)
     tick_step = _tick_step(duration)
-    ticks = np.arange(0, duration + 1e-9, tick_step)
-    ax.set_xticks(ticks)
-    ax.set_xticklabels([f"{int(round(t))}" for t in ticks])
-    fig.tight_layout()
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi)
-    plt.close(fig)
-    buf.seek(0)
-    b64 = base64.b64encode(buf.read()).decode("ascii")
+    png_bytes = _compute_spectrogram_png(
+        samples, sample_rate, spec_frame_size, spec_hop_size, width_px, duration, tick_step
+    )
+    b64 = base64.b64encode(png_bytes).decode("ascii")
 
     block = f"""
     <div style="font-family: -apple-system, Segoe UI, Roboto, sans-serif;">
@@ -360,11 +426,11 @@ def render_spectrogram_card(
       <div style="overflow-x:auto; overflow-y:hidden; border:1px solid #e5e7eb;
                   border-radius:10px; background:#ffffff; padding:8px;
                   box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
-        <img src="data:image/png;base64,{b64}" style="display:block; width:{width_px}px; height:{height_px}px;" />
+        <img src="data:image/png;base64,{b64}" style="display:block; width:{width_px}px; height:{SPECTROGRAM_HEIGHT_PX}px;" />
       </div>
     </div>
     """
-    components.html(block, height=height_px + 60, scrolling=False)
+    components.html(block, height=SPECTROGRAM_HEIGHT_PX + 60, scrolling=False)
 
 
 # --------------------------------------------------------------------------
@@ -409,8 +475,11 @@ if process_clicked and audio_path:
             # Identity sanity check — only meaningful when nothing was changed.
             if speed_factor == 1.0 and semitone_shift == 0.0:
                 n = min(len(original_audio), len(reconstructed))
-                error = original_audio[:n].astype(np.float64) - reconstructed[:n].astype(np.float64)
-                signal_power = np.mean(original_audio[:n].astype(np.float64) ** 2)
+                # Cast once and reuse — the old code cast `original_audio[:n]`
+                # to float64 twice (once for `error`, once for `signal_power`).
+                original_f64 = original_audio[:n].astype(np.float64)
+                error = original_f64 - reconstructed[:n].astype(np.float64)
+                signal_power = np.mean(original_f64 ** 2)
                 noise_power = np.mean(error ** 2)
                 if noise_power > 0:
                     snr_str = f"{10.0 * np.log10(signal_power / noise_power):.1f} dB"

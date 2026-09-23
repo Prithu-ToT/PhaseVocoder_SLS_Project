@@ -48,8 +48,10 @@ def normalize_audio(audio: np.ndarray) -> np.ndarray:
         1-D float32 array scaled so that
         ``max(abs(normalized)) ≈ 0.99``.
     """
-    # Find the peak absolute value across the entire signal
-    peak: float = float(np.max(np.abs(audio)))
+    # Find the peak absolute value across the entire signal. max(abs(x)) ==
+    # max(x.max(), -x.min()) for any real array, so this gets the same peak
+    # as np.abs(audio).max() without allocating a full-size abs() copy.
+    peak: float = float(max(audio.max(), -audio.min()))
 
     if peak < 1e-10:
         # Signal is essentially silent — nothing to scale.
@@ -58,9 +60,15 @@ def normalize_audio(audio: np.ndarray) -> np.ndarray:
     # Headroom factor keeps us safely below the ±1.0 clipping boundary.
     headroom: float = 0.99
 
-    normalized: np.ndarray = (audio / peak) * headroom
+    # Fold the divide and the headroom multiply into one scale factor so
+    # there's only one elementwise pass over the (possibly large) signal
+    # instead of two, and let astype's copy (needed anyway for the dtype
+    # change) be the only allocation — copy=False skips it entirely on the
+    # rare case `audio` is already float32.
+    scale: float = headroom / peak
+    normalized: np.ndarray = audio * scale
 
-    return normalized.astype(np.float32)
+    return normalized.astype(np.float32, copy=False)
 
 
 class AudioLoader:
