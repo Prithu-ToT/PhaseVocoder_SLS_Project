@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import soundfile as sf
+from pathlib import Path
 
 if TYPE_CHECKING:
     # Only needed for static type checking (Pylance/pyright). matplotlib
@@ -47,8 +48,10 @@ def normalize_audio(audio: np.ndarray) -> np.ndarray:
         1-D float32 array scaled so that
         ``max(abs(normalized)) ≈ 0.99``.
     """
-    # Find the peak absolute value across the entire signal
-    peak: float = float(np.max(np.abs(audio)))
+    # Find the peak absolute value across the entire signal. max(abs(x)) ==
+    # max(x.max(), -x.min()) for any real array, so this gets the same peak
+    # as np.abs(audio).max() without allocating a full-size abs() copy.
+    peak: float = float(max(audio.max(), -audio.min()))
 
     if peak < 1e-10:
         # Signal is essentially silent — nothing to scale.
@@ -57,9 +60,15 @@ def normalize_audio(audio: np.ndarray) -> np.ndarray:
     # Headroom factor keeps us safely below the ±1.0 clipping boundary.
     headroom: float = 0.99
 
-    normalized: np.ndarray = (audio / peak) * headroom
+    # Fold the divide and the headroom multiply into one scale factor so
+    # there's only one elementwise pass over the (possibly large) signal
+    # instead of two, and let astype's copy (needed anyway for the dtype
+    # change) be the only allocation — copy=False skips it entirely on the
+    # rare case `audio` is already float32.
+    scale: float = headroom / peak
+    normalized: np.ndarray = audio * scale
 
-    return normalized.astype(np.float32)
+    return normalized.astype(np.float32, copy=False)
 
 
 class AudioLoader:
@@ -172,6 +181,56 @@ class AudioLoader:
         if audio_data is None or not sample_rate:
             return 0.0
         return len(audio_data) / sample_rate
+
+    def unload(self) -> str:
+        """Write the loaded audio data to a WAV file.
+
+        The output file is created in the same directory as the input file
+        with "_output" appended to its filename.
+
+        Example
+        -------
+        input:
+            "music/song.mp3"
+
+        output:
+            "music/song_output.wav"
+
+        Returns
+        -------
+        str
+            Path of the generated WAV file.
+
+        Raises
+        ------
+        RuntimeError
+            If no audio has been loaded yet.
+        """
+        audio_data = self.audio_data
+        sample_rate = self.sample_rate
+        file_path = self.file_path
+
+        if audio_data is None or sample_rate is None or file_path is None:
+            raise RuntimeError(
+                "No audio loaded yet — call `load(file_path)` "
+                "or pass `file_path` to the constructor first."
+            )
+
+        input_path = Path(file_path)
+
+        output_path = input_path.with_name(
+            f"{input_path.stem}_output.wav"
+        )
+
+        sf.write(
+            output_path,
+            audio_data,
+            sample_rate,
+            subtype="PCM_16",
+        )
+
+        return str(output_path)
+
 
     # ------------------------------------------------------------------
     # Plotting
