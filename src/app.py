@@ -3,541 +3,377 @@ app.py – Phase Vocoder Studio (Streamlit front end)
 =====================================================
 Time-stretch and pitch-shift audio through a custom STFT phase vocoder.
 
-Architecture used here:
-    - `AudioLoader`          (audio_loader.py)          – file I/O + normalize_audio
-    - `STFTProcessor`        (stft_processor.py)        – STFT / ISTFT, windowing
-    - `VocoderOrchestrator`  (vocoder_orchestrator.py)  – workflow: picks/coordinates
-      the processing pipeline (fast phase-manipulation vs. accurate resample+stretch,
-      naive-resample comparison) and persists the accurate-mode result to disk.
-      See architecture.md / orchastration.md for the full rationale.
+This file only composes the page; each responsibility lives in its own
+module (see MODULES.md for the full map):
+    - `sidebar.py`            – every control; returns a `Settings`
+    - `processing.py`         – runs one Process request -> `ProcessingResult`
+    - `waveform_panel.py`     – Waveforms panel (cursor, playback, view controls)
+    - `spectrogram_panel.py`  – Spectrograms panel (same view controls)
+    - `panel_common.py`       – what the two panels share
 
-Dispatch rule (per project owner): the "Pitch-Shift Mode" toggle alone
-decides which vocoder path runs — Fast always calls
-`orchestrator.vocoder_process`, Accurate always calls
-`orchestrator.process_and_write` — regardless of whether the semitone
-shift is 0.
+Processing itself goes through `VocoderOrchestrator` (vocoder_orchestrator.py),
+which picks/coordinates the fast phase-manipulation vs. accurate
+resample+stretch pipeline. See architecture.md for the full rationale.
 """
 
-import base64
-import html as _html
-import io
-import os
-import tempfile
+import json
 
-import matplotlib.pyplot as plt
-import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
 
-from audio_loader import AudioLoader, normalize_audio
-from stft_processor import STFTProcessor
-from vocoder_orchestrator import VocoderOrchestrator
+from panel_common import (
+    COLOR_ACCENT,
+    COLOR_BG,
+    COLOR_BORDER,
+    COLOR_BORDER_LIGHT,
+    COLOR_SURFACE,
+    COLOR_TEXT_BRIGHT,
+    COLOR_TEXT_BRIGHTEST,
+    COLOR_TEXT_DIM,
+)
+from processing import run_processing
+from sidebar import RESULTS_KEY, SHOW_SPECTROGRAMS_KEY, render_sidebar
+from spectrogram_panel import render_spectrogram_group
+from waveform_panel import render_legend, render_players, render_waveform_group
 
-# Fast mode (vocoder_process) rotates STFT phase directly to shift pitch.
-# Past a few semitones this smears energy across neighboring frequency
-# bins, so it's capped. Accurate mode resamples then time-stretches back,
-# so it tolerates a much wider range.
-FAST_MODE_MAX_SEMITONES = 3.0
-ACCURATE_MODE_MAX_SEMITONES = 12.0
-
-# Speed factor must satisfy 0.20 < speed_factor < 2.5 (vocoder_processor
-# .get_synthesis_hop). Keep the slider comfortably inside that range.
-SPEED_MIN, SPEED_MAX = 0.25, 2.4
+# Track colors, shared by the legend and the waveform panel.
+COLOR_ORIGINAL = "#2563eb"
+COLOR_PROCESSED = "#059669"
+COLOR_NAIVE = "#d97706"
 
 st.set_page_config(page_title="Phase Vocoder Studio", page_icon="🎚️", layout="wide")
+
+# Session-state keys for the "scroll results into view" trick below — kept
+# separate from RESULTS_KEY/SHOW_SPECTROGRAMS_KEY since they track *when* a
+# result last changed, not the result itself.
+_RESULT_RUN_ID_KEY = "_pv_result_run_id"
+_SCROLLED_RUN_ID_KEY = "_pv_scrolled_run_id"
 
 # --------------------------------------------------------------------------
 # Light visual polish — this is meant to read as a small product, not a
 # lab notebook, so we tone down the emoji/step-by-step "assignment" framing.
+# No hero banner in the page body: the title lives in Streamlit's own top
+# header bar (the strip holding the hamburger menu / Deploy button) instead,
+# via a CSS ::before pseudo-element — one less dark card competing for
+# attention above the results. The header is also given the app's
+# "raised surface" color so it reads as a panel rather than blending into
+# the page background.
 # --------------------------------------------------------------------------
 st.markdown(
-    """
+    f"""
     <style>
-      .pv-hero {
-          padding: 1.1rem 1.4rem;
-          border-radius: 14px;
-          background: linear-gradient(135deg, #1f2937 0%, #374151 100%);
-          color: #f9fafb;
-          margin-bottom: 1.3rem;
-      }
-      .pv-hero h1 {
-          margin: 0 0 0.25rem 0;
-          font-size: 1.6rem;
+      header[data-testid="stHeader"] {{
+          background: {COLOR_SURFACE};
+          border-bottom: 1px solid {COLOR_BORDER};
+      }}
+      header[data-testid="stHeader"]::before {{
+          content: "Phase Vocoder";
+          position: absolute;
+          left: 1rem;
+          top: 50%;
+          transform: translateY(-50%);
+          font-size: 1.05rem;
           font-weight: 700;
-      }
-      .pv-hero p {
-          margin: 0;
-          opacity: 0.85;
-          font-size: 0.95rem;
-      }
-      .pv-section-title {
+          color: {COLOR_TEXT_BRIGHTEST};
+          pointer-events: none;
+      }}
+      .pv-section-title {{
           font-size: 1.05rem;
           font-weight: 600;
           margin: 1.4rem 0 0.5rem 0;
           color: inherit;
-      }
+      }}
+      .st-key-pv_spectro_placeholder {{
+          background: {COLOR_BG};
+          border: 1px solid {COLOR_BORDER};
+          border-radius: 10px;
+          padding: 14px 18px;
+          min-height: 90px;
+          display: flex;
+          align-items: center;
+      }}
+      .st-key-pv_spectro_placeholder p {{
+          color: {COLOR_TEXT_DIM};
+          margin: 0;
+          font-size: 0.85rem;
+      }}
     </style>
-    <div class="pv-hero">
-      <h1>Phase Vocoder Studio</h1>
-      <p>Change the speed of a recording without changing its pitch — or shift its pitch without changing its speed — using a custom short-time Fourier phase vocoder.</p>
-    </div>
     """,
     unsafe_allow_html=True,
 )
 
-# --------------------------------------------------------------------------
-# Sidebar — engine internals only
-# --------------------------------------------------------------------------
-st.sidebar.header("Engine Settings")
-
-frame_size = st.sidebar.select_slider(
-    "Frame Size (FFT window)",
-    options=[512, 1024, 2048, 4096, 8192],
-    value=2048,
-    help="Analysis window length. Larger = better frequency resolution; smaller = better time resolution.",
-)
-
-overlap_ratio = st.sidebar.slider(
-    "Overlap (%)",
-    min_value=50,
-    max_value=90,
-    value=75,
-    step=5,
-    help="Overlap between successive analysis frames. 75% is standard for Hanning-window reconstruction.",
-)
-
-hop_size = int(frame_size * (1 - (overlap_ratio / 100.0)))
-st.sidebar.caption(f"Analysis hop size: **{hop_size} samples**")
+settings = render_sidebar()
 
 # --------------------------------------------------------------------------
-# Main — 1. Audio source
+# Processing — the result goes into session_state so it survives the rerun
+# triggered by any later click (e.g. Generate Spectrograms).
 # --------------------------------------------------------------------------
-st.markdown('<div class="pv-section-title">Your Audio</div>', unsafe_allow_html=True)
-
-source_option = st.radio(
-    "Audio source",
-    options=["Sample track", "Upload a file", "Record with microphone"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
-
-audio_path = None
-
-if source_option == "Sample track":
-    default_path = os.path.join("target_io", "mohiner_ghoraguli_sample.mp3")
-    if os.path.exists(default_path):
-        audio_path = default_path
-        st.caption("Using the built-in sample track.")
-    else:
-        st.error(f"Sample file not found at {default_path}. Please upload or record instead.")
-
-elif source_option == "Upload a file":
-    uploaded_file = st.file_uploader(
-        "Upload audio", type=["mp3", "wav", "flac", "ogg"], label_visibility="collapsed"
-    )
-    if uploaded_file is not None:
-        temp_dir = tempfile.gettempdir()
-        temp_file_path = os.path.join(temp_dir, uploaded_file.name)
-        with open(temp_file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        audio_path = temp_file_path
-        st.caption(f"Loaded: {uploaded_file.name}")
-
-else:  # Record with microphone
-    recorded = st.audio_input("Record audio")
-    if recorded is not None:
-        temp_dir = tempfile.gettempdir()
-        temp_file_path = os.path.join(temp_dir, "pv_recorded_input.wav")
-        with open(temp_file_path, "wb") as f:
-            f.write(recorded.getvalue())
-        audio_path = temp_file_path
-        st.caption("Recording captured.")
-
-# --------------------------------------------------------------------------
-# Main — 2. Vocoder parameters (pulled up from the sidebar on purpose —
-# these are the knobs the audience actually cares about)
-# --------------------------------------------------------------------------
-st.markdown('<div class="pv-section-title">Vocoder Parameters</div>', unsafe_allow_html=True)
-
-param_col1, param_col2 = st.columns(2)
-
-with param_col1:
-    speed_factor = st.slider(
-        "Speed factor",
-        min_value=SPEED_MIN,
-        max_value=SPEED_MAX,
-        value=1.0,
-        step=0.05,
-        help="1.0 = original speed. Above 1 speeds up (shortens); below 1 slows down (lengthens).",
-    )
-
-with param_col2:
-    mode = st.radio(
-        "Pitch-shift mode",
-        options=["Fast (phase manipulation)", "Accurate (resample + stretch)"],
-        help=(
-            "Fast rotates STFT phase directly — cheap, but large shifts smear energy across "
-            "frequency bins, so it's capped at ±3 semitones. Accurate resamples the signal to "
-            "shift pitch, then time-stretches it back with the phase vocoder — higher quality "
-            "across a wider range."
-        ),
-    )
-
-is_fast = mode.startswith("Fast")
-max_semitones = FAST_MODE_MAX_SEMITONES if is_fast else ACCURATE_MODE_MAX_SEMITONES
-
-# Keep any previously-chosen shift within the current mode's allowed range
-# (switching Accurate -> Fast could otherwise leave a stale out-of-range value).
-if "semitone_shift" not in st.session_state:
-    st.session_state.semitone_shift = 0.0
-st.session_state.semitone_shift = max(
-    -max_semitones, min(max_semitones, st.session_state.semitone_shift)
-)
-
-semitone_shift = st.slider(
-    "Pitch shift (semitones)",
-    min_value=-max_semitones,
-    max_value=max_semitones,
-    step=0.5,
-    key="semitone_shift",
-)
-
-if is_fast:
-    st.caption(
-        f"Fast mode is capped at ±{FAST_MODE_MAX_SEMITONES:.0f} semitones — larger shifts smear "
-        "energy across STFT bins. Switch to Accurate for bigger shifts."
-    )
-
-show_naive = st.checkbox(
-    "Also produce a naive-resample comparison clip",
-    help=(
-        "Resamples the original audio to the same duration change as above using plain "
-        "interpolation — no phase vocoder involved. This changes pitch along with speed, "
-        "unlike the vocoder output above it, which is the whole point of the demo. The "
-        "pitch-shift setting has no effect on this clip."
-    ),
-)
-
-process_clicked = st.button("Process Audio", type="primary", disabled=audio_path is None)
-
-# --------------------------------------------------------------------------
-# Shared plotting helpers — waveform + spectrogram cards, stacked, scrollable,
-# on a common horizontal (time) scale with fixed-interval timestamp markers.
-# --------------------------------------------------------------------------
-PX_PER_SECOND = 120     # shared time scale so waveform & spectrogram widths line up
-MIN_PLOT_WIDTH = 900
-MAX_PLOT_WIDTH = 12000
-
-# A spectrogram is a raster, not an SVG polyline like the waveform: imshow
-# colorizes the *entire* data array to RGBA before it's ever downsampled to
-# the figure's pixel size. At MAX_PLOT_WIDTH-scale widths on a long clip
-# that colorization step alone can try to allocate multiple GB (this is
-# what was crashing render_spectrogram_card — see traceback: a 2.5 GiB
-# float64 (1025, 81895, 4) RGBA array). Cap the spectrogram narrower than
-# the waveform and downsample the magnitude array itself before it reaches
-# imshow (same idea as the waveform's own step-slicing below).
-SPECTROGRAM_MAX_WIDTH_PX = 2400
-SPECTROGRAM_MAX_TIME_BINS = 2000
-SPECTROGRAM_HEIGHT_PX = 260
-
-
-def _plot_width(duration: float) -> int:
-    return int(max(MIN_PLOT_WIDTH, min(MAX_PLOT_WIDTH, duration * PX_PER_SECOND)))
-
-
-def _tick_step(duration: float) -> float:
-    """Timestamp marker spacing: 10s for shorter clips, 15s otherwise."""
-    return 10.0 if duration <= 90 else 15.0
-
-
-def render_legend(items: list[tuple[str, str]]) -> None:
-    swatches = "".join(
-        f'<span style="display:inline-flex; align-items:center; margin-right:18px;">'
-        f'<span style="width:12px; height:12px; border-radius:3px; background:{color}; '
-        f'display:inline-block; margin-right:6px;"></span>'
-        f'<span style="font-size:0.85rem; color:#374151;">{_html.escape(label)}</span></span>'
-        for label, color in items
-    )
-    st.markdown(f'<div style="margin:0.1rem 0 0.9rem 0;">{swatches}</div>', unsafe_allow_html=True)
-
-
-@st.cache_data(show_spinner=False, max_entries=8)
-def _waveform_svg(samples: np.ndarray, sample_rate: int, color: str) -> tuple[str, int]:
-    """Build a horizontally-scrollable SVG waveform. Returns (svg_markup, width).
-
-    Cached (pure function of its args) so re-running the Streamlit script —
-    which happens on every widget interaction — doesn't rebuild the same
-    SVG for the same clip/color each time.
-    """
-    n = len(samples)
-    height = 160
-    mid = height / 2
-
-    if n == 0 or sample_rate <= 0:
-        return f'<svg width="900" height="{height}"></svg>', 900
-
-    duration = n / sample_rate
-    width = _plot_width(duration)
-
-    target_points = 4000
-    step = max(1, n // target_points)
-    # `samples[::step]` is already a view, not a copy. The old `.astype
-    # (np.float64)` here turned that view into a full float64 copy for no
-    # reason — SVG coordinates are formatted to 1 decimal place anyway, so
-    # plain float32 (or whatever dtype `samples` already is) is plenty.
-    pts = samples[::step]
-
-    peak = max(1e-6, float(np.max(np.abs(pts))))
-    xs = np.linspace(0, width, num=len(pts))
-    ys = mid - (pts / peak) * (mid * 0.88)
-    poly_points = " ".join(f"{x:.1f},{y:.1f}" for x, y in zip(xs, ys))
-
-    tick_step = _tick_step(duration)
-    grid_lines = []
-    labels = []
-    t = 0.0
-    while t <= duration + 1e-9:
-        x = (t / duration) * width if duration > 0 else 0.0
-        grid_lines.append(
-            f'<line x1="{x:.1f}" y1="0" x2="{x:.1f}" y2="{height - 16}" '
-            f'stroke="#e5e7eb" stroke-width="1"/>'
-        )
-        labels.append(
-            f'<text x="{x:.1f}" y="{height - 4}" font-size="10" fill="#9ca3af" '
-            f'text-anchor="middle">{int(round(t))}s</text>'
-        )
-        t += tick_step
-
-    svg = f"""
-    <svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">
-      {''.join(grid_lines)}
-      <line x1="0" y1="{mid}" x2="{width}" y2="{mid}" stroke="#d1d5db" stroke-width="1" stroke-dasharray="4,4"/>
-      <polyline points="{poly_points}" fill="none" stroke="{color}" stroke-width="1.4"/>
-      {''.join(labels)}
-    </svg>
-    """
-    return svg, width
-
-
-def render_waveform_card(title: str, samples: np.ndarray, sample_rate: int, color: str) -> None:
-    svg, width = _waveform_svg(samples, sample_rate, color)
-    block = f"""
-    <div style="font-family: -apple-system, Segoe UI, Roboto, sans-serif;">
-      <div style="font-weight:600; font-size:0.92rem; margin-bottom:6px; color:#374151;">
-        {_html.escape(title)}
-      </div>
-      <div style="overflow-x:auto; overflow-y:hidden; border:1px solid #e5e7eb;
-                  border-radius:10px; background:#ffffff; padding:8px;
-                  box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
-        {svg}
-      </div>
-    </div>
-    """
-    components.html(block, height=200, scrolling=False)
-
-
-@st.cache_data(show_spinner=False, max_entries=8)
-def _compute_spectrogram_png(
-    samples: np.ndarray,
-    sample_rate: int,
-    spec_frame_size: int,
-    spec_hop_size: int,
-    width_px: int,
-    duration: float,
-    tick_step: float,
-) -> bytes:
-    """Compute the spectrogram PNG bytes for one clip/settings combination.
-
-    Cached so re-running the Streamlit script (any widget interaction reruns
-    the whole file top to bottom) doesn't redo this allocation-heavy work —
-    and since only the small PNG bytes are kept in the cache, the large
-    intermediate arrays (stft_matrix, mag_db) are freed right after this
-    function returns instead of lingering in memory across reruns.
-    """
-    spec_processor = STFTProcessor(frame_size=spec_frame_size, hop_size=spec_hop_size)
-    stft_matrix = spec_processor.stft(samples)
-
-    # float32 halves what the imshow colorization step below has to hold —
-    # dB magnitude values don't need float64 precision to look right on a
-    # plot.
-    mag_db = (20 * np.log10(np.abs(stft_matrix) + 1e-10)).astype(np.float32)
-    extent_duration = stft_matrix.shape[1] * spec_hop_size / sample_rate
-
-    # imshow colorizes the FULL array to RGBA before it's ever resampled
-    # down to the figure's actual pixel size — on a long clip (tens of
-    # thousands of frames) that colorization step alone can try to
-    # allocate multiple GB, which is what was crashing this function (see
-    # module-level comment above SPECTROGRAM_MAX_WIDTH_PX). Downsample the
-    # time axis ourselves first, the same way the waveform plot already
-    # strides down to ~4000 points in `_waveform_svg` above.
-    time_bins = mag_db.shape[1]
-    target_bins = min(time_bins, SPECTROGRAM_MAX_TIME_BINS, width_px)
-    step = max(1, time_bins // target_bins)
-    if step > 1:
-        mag_db = mag_db[:, ::step]
-
-    dpi = 100
-
-    fig, ax = plt.subplots(
-        figsize=(width_px / dpi, SPECTROGRAM_HEIGHT_PX / dpi), dpi=dpi
-    )
-    ax.imshow(
-        mag_db,
-        origin="lower",
-        aspect="auto",
-        extent=[0, extent_duration, 0, sample_rate / 2],
-        cmap="magma",
-    )
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Frequency (Hz)")
-
-    ticks = np.arange(0, duration + 1e-9, tick_step)
-    ax.set_xticks(ticks)
-    ax.set_xticklabels([f"{int(round(t))}" for t in ticks])
-    fig.tight_layout()
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi)
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def render_spectrogram_card(
-    title: str, samples: np.ndarray, sample_rate: int, spec_frame_size: int, spec_hop_size: int
-) -> None:
-    """Magnitude spectrogram (dB) of `samples`, computed fresh at the
-    sidebar's current frame/hop settings, rendered wide + horizontally
-    scrollable on the same time scale as the waveform cards above."""
-    if len(samples) < spec_frame_size:
-        st.caption(f"{title}: clip too short to compute a spectrogram at this frame size.")
-        return
-
-    duration = len(samples) / sample_rate
-    width_px = min(_plot_width(duration), SPECTROGRAM_MAX_WIDTH_PX)
-    tick_step = _tick_step(duration)
-
-    png_bytes = _compute_spectrogram_png(
-        samples, sample_rate, spec_frame_size, spec_hop_size, width_px, duration, tick_step
-    )
-    b64 = base64.b64encode(png_bytes).decode("ascii")
-
-    block = f"""
-    <div style="font-family: -apple-system, Segoe UI, Roboto, sans-serif;">
-      <div style="font-weight:600; font-size:0.92rem; margin-bottom:6px; color:#374151;">
-        {_html.escape(title)}
-      </div>
-      <div style="overflow-x:auto; overflow-y:hidden; border:1px solid #e5e7eb;
-                  border-radius:10px; background:#ffffff; padding:8px;
-                  box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
-        <img src="data:image/png;base64,{b64}" style="display:block; width:{width_px}px; height:{SPECTROGRAM_HEIGHT_PX}px;" />
-      </div>
-    </div>
-    """
-    components.html(block, height=SPECTROGRAM_HEIGHT_PX + 60, scrolling=False)
-
-
-# --------------------------------------------------------------------------
-# Processing
-# --------------------------------------------------------------------------
-if process_clicked and audio_path:
+if settings.process_clicked and settings.audio_path:
     with st.spinner("Running the phase vocoder..."):
         try:
-            loader = AudioLoader(audio_path)
-            original_audio = loader.audio_data
-            sr = loader.sample_rate
-
-            stft_processor = STFTProcessor(frame_size=frame_size, hop_size=hop_size)
-            orchestrator = VocoderOrchestrator(loader, stft_processor)
-
-            # Dispatch purely on the selected mode, regardless of semitone value.
-            if is_fast:
-                pitch_factor = 2.0 ** (semitone_shift / 12.0)
-                reconstructed = orchestrator.vocoder_process(speed_factor, pitch_factor=pitch_factor)
-            else:
-                # Accurate mode also writes the result to disk (via
-                # AudioLoader.unload(), next to the input file) as a side
-                # effect — no UI change, this is an internal persistence
-                # step of the orchestration workflow.
-                reconstructed = orchestrator.process_and_write(speed_factor, semitone_shift)
-
-            output = normalize_audio(reconstructed)
-
-            naive_output = None
-            if show_naive:
-                # Plain resample to the same duration change — no phase
-                # correction, so pitch shifts along with speed. This is the
-                # contrast case: same duration change, no pitch preservation.
-                duration_factor = 1.0 / speed_factor
-                naive_loader = orchestrator.get_resampled_audioloader(duration_factor)
-                naive_output = normalize_audio(naive_loader.audio_data)
-
-            st.markdown('<div class="pv-section-title">Results</div>', unsafe_allow_html=True)
-
-            metric_cols = st.columns(4)
-            metric_cols[0].metric("Sample Rate", f"{sr} Hz")
-            metric_cols[1].metric("Original Duration", f"{loader.duration_seconds:.2f} s")
-            metric_cols[2].metric("Output Duration", f"{len(output) / sr:.2f} s")
-            metric_cols[3].metric("Pitch Shift", f"{semitone_shift:+.1f} st", delta=mode.split(" ")[0])
-
-            # Identity sanity check — only meaningful when nothing was changed.
-            if speed_factor == 1.0 and semitone_shift == 0.0:
-                n = min(len(original_audio), len(reconstructed))
-                # Cast once and reuse — the old code cast `original_audio[:n]`
-                # to float64 twice (once for `error`, once for `signal_power`).
-                original_f64 = original_audio[:n].astype(np.float64)
-                error = original_f64 - reconstructed[:n].astype(np.float64)
-                signal_power = np.mean(original_f64 ** 2)
-                noise_power = np.mean(error ** 2)
-                if noise_power > 0:
-                    snr_str = f"{10.0 * np.log10(signal_power / noise_power):.1f} dB"
-                else:
-                    snr_str = "∞ dB (bit-exact)"
-                st.caption(f"Identity check (speed 1.0, shift 0 st) — reconstruction SNR: {snr_str}")
-
-            st.markdown("**Waveforms**")
-            legend_items = [("Original", "#2563eb"), (f"Processed — {mode}", "#059669")]
-            if naive_output is not None:
-                legend_items.append(("Naive resample", "#d97706"))
-            render_legend(legend_items)
-
-            render_waveform_card("Original", original_audio, sr, "#2563eb")
-            render_waveform_card(f"Processed — {mode}", output, sr, "#059669")
-            if naive_output is not None:
-                render_waveform_card(
-                    "Naive resample (pitch shifts too — no phase correction)",
-                    naive_output,
-                    sr,
-                    "#d97706",
-                )
-
-            st.markdown("**Spectrograms**")
-            render_spectrogram_card("Original — spectrogram", original_audio, sr, frame_size, hop_size)
-            render_spectrogram_card(
-                f"Processed — {mode} — spectrogram", output, sr, frame_size, hop_size
+            result = run_processing(
+                settings.audio_path,
+                settings.speed_factor,
+                settings.semitone_shift,
+                fast=settings.is_fast,
+                mode_label=settings.mode,
+                frame_size=settings.frame_size,
+                hop_size=settings.hop_size,
+                include_naive=settings.show_naive,
             )
-            if naive_output is not None:
-                render_spectrogram_card(
-                    "Naive resample — spectrogram", naive_output, sr, frame_size, hop_size
-                )
-
-            st.markdown("**Listen**")
-            listen_col1, listen_col2 = st.columns(2)
-            with listen_col1:
-                st.write("Original")
-                st.audio(original_audio, format="audio/wav", sample_rate=sr)
-            with listen_col2:
-                st.write(f"Processed — {mode}")
-                st.audio(output, format="audio/wav", sample_rate=sr)
-
-            if naive_output is not None:
-                st.write("Naive resample — same duration change, pitch not preserved")
-                st.audio(naive_output, format="audio/wav", sample_rate=sr)
-
         except Exception as e:
             st.error(f"An error occurred during audio processing: {str(e)}")
-            import traceback
-            st.code(traceback.format_exc())
+            if "regular file" in str(e) or "possibly a pipe" in str(e):
+                st.caption(
+                    "This usually means the file isn't actually the format its extension "
+                    "claims — e.g. some \"video to mp3\" downloaders save a raw MP4/AAC "
+                    "stream with a `.mp3` name. Try a real WAV/FLAC/OGG/MP3 file instead."
+                )
+            with st.expander("Technical details"):
+                import traceback
+                st.code(traceback.format_exc())
+        else:
+            st.session_state[RESULTS_KEY] = result
+            # New results — spectrograms have to be requested again.
+            st.session_state[SHOW_SPECTROGRAMS_KEY] = False
+            # Bump the run id so the results section scrolls into view once,
+            # on the render right after this rerun — and not again on an
+            # unrelated rerun (e.g. the Generate Spectrograms click) where
+            # the run id stays the same.
+            st.session_state[_RESULT_RUN_ID_KEY] = st.session_state.get(_RESULT_RUN_ID_KEY, 0) + 1
+            # Rerun so the sidebar's Generate Spectrograms button (already
+            # drawn, disabled) picks up the new results.
+            st.rerun()
 
-elif audio_path is None:
-    st.info("Choose a sample track, upload a file, or record from your microphone to get started.")
+# --------------------------------------------------------------------------
+# Results
+# --------------------------------------------------------------------------
+results = st.session_state.get(RESULTS_KEY)
+
+if results is not None:
+    sr = results.sample_rate
+
+    # Persistent results footer — docked to the bottom of the *browser*
+    # viewport (not just this Streamlit block), so it stays on screen while
+    # scrolling. That means its markup can't just live in the normal
+    # Streamlit element tree: the script below reaches into the parent page
+    # (window.parent.document, same trick waveform_panel.py's findAudios()
+    # uses) and creates/updates a fixed-position bar there directly, the
+    # first time this runs, then just refreshes its summary text on later
+    # reruns. Play/Pause and Mute drive the same hidden <audio> elements the
+    # Waveforms panel's own transport controls use — "Play" resumes
+    # whichever track isn't playing yet (or the first one, if none is);
+    # "Pause" stops whatever's currently playing.
+    #
+    # This is also where the Results metrics live now — moved here from
+    # the main panel so they're visible without scrolling back up, same
+    # numbers as before (Sample Rate / Original & Output Duration / Pitch
+    # Shift / identity-check SNR), just laid out as one line.
+    _footer_out_duration = len(results.output) / sr if sr else 0.0
+    _footer_stats = [
+        f"{sr} Hz",
+        f"Original {results.original_duration:.2f} s",
+        f"Output {_footer_out_duration:.2f} s",
+        f"{results.mode.split(' ')[0]} pitch shift {results.semitone_shift:+.1f} st",
+    ]
+    if results.snr is not None:
+        _footer_stats.append(f"SNR {results.snr}")
+    components.html(
+        f"""
+        <script>
+          (function () {{
+            const doc = window.parent.document;
+
+            if (!doc.getElementById("pv-footer-style")) {{
+              const style = doc.createElement("style");
+              style.id = "pv-footer-style";
+              style.textContent = `
+                #pv-footer {{
+                  position: fixed; right: 0; bottom: 0; z-index: 999999;
+                  display: flex; align-items: center; gap: 0.9rem;
+                  background: {COLOR_SURFACE}; border-top: 1px solid {COLOR_BORDER};
+                  color: {COLOR_TEXT_DIM}; font-size: 0.8rem;
+                  padding: 0.5rem 1.2rem; font-variant-numeric: tabular-nums;
+                  box-shadow: 0 -2px 6px rgba(0,0,0,0.35);
+                }}
+                #pv-footer .pv-footer-summary {{ flex: 1 1 auto; white-space: nowrap; overflow-x: auto; }}
+                #pv-footer .pv-footer-chip {{
+                  display: inline-block; background: {COLOR_BORDER}; color: {COLOR_TEXT_BRIGHT};
+                  border: 1px solid {COLOR_BORDER_LIGHT}; border-radius: 5px;
+                  padding: 2px 9px; margin-right: 6px; font-weight: 600;
+                }}
+                #pv-footer button {{
+                  background: {COLOR_BORDER}; color: {COLOR_TEXT_BRIGHT}; border: 1px solid {COLOR_BORDER_LIGHT};
+                  border-radius: 6px; padding: 4px 12px; cursor: pointer; font-size: 0.8rem;
+                }}
+                #pv-footer button:hover {{ background: {COLOR_BORDER_LIGHT}; }}
+                #pv-footer button.pv-on {{ background: {COLOR_ACCENT}; color: #111827; border-color: {COLOR_ACCENT}; }}
+              `;
+              doc.head.appendChild(style);
+            }}
+
+            let footer = doc.getElementById("pv-footer");
+            const isNewFooter = !footer;
+            if (isNewFooter) {{
+              footer = doc.createElement("div");
+              footer.id = "pv-footer";
+              footer.innerHTML =
+                '<span class="pv-footer-summary" id="pv-footer-summary"></span>' +
+                '<button id="pv-footer-wave" type="button">Waveforms</button>' +
+                '<button id="pv-footer-spec" type="button">Spectrograms</button>' +
+                '<button id="pv-footer-play" type="button">▶ Play</button>' +
+                '<button id="pv-footer-mute" type="button">🔊 Mute</button>';
+              doc.body.appendChild(footer);
+
+              const main = doc.querySelector('[data-testid="stMain"]') || doc.querySelector("section.main");
+              if (main) main.style.paddingBottom = "54px";
+            }}
+
+            // The footer only spans the main content area — not the sidebar
+            // (Process Audio / Generate Spectrograms sit at its bottom, and
+            // a full-width fixed bar was drawing over them). Re-measured on
+            // every rerun and every poll tick since the sidebar can be
+            // resized or collapsed without either firing a resize event.
+            function positionFooter() {{
+              const sidebar = doc.querySelector('[data-testid="stSidebar"]');
+              const left = sidebar ? sidebar.getBoundingClientRect().right : 0;
+              footer.style.left = Math.max(0, left) + "px";
+            }}
+            positionFooter();
+
+            if (isNewFooter) {{
+              doc.defaultView.addEventListener("resize", positionFooter);
+
+              const audios = () => Array.from(doc.querySelectorAll(".st-key-pv_players audio"));
+              const waveBtn = footer.querySelector("#pv-footer-wave");
+              const specBtn = footer.querySelector("#pv-footer-spec");
+              const playBtn = footer.querySelector("#pv-footer-play");
+              const muteBtn = footer.querySelector("#pv-footer-mute");
+
+              const scrollToSection = id => {{
+                const el = doc.getElementById(id);
+                if (el) el.scrollIntoView({{ behavior: "smooth", block: "start" }});
+              }};
+              waveBtn.addEventListener("click", () => scrollToSection("waveforms"));
+              specBtn.addEventListener("click", () => scrollToSection("spectrograms"));
+
+              playBtn.addEventListener("click", () => {{
+                const a = audios();
+                if (!a.length) return;
+                const playing = a.find(x => !x.paused);
+                if (playing) {{
+                  playing.pause();
+                }} else {{
+                  const next = a.find(x => x.currentTime > 0) || a[0];
+                  const p = next.play();
+                  if (p && p.catch) p.catch(() => {{}});
+                }}
+              }});
+
+              muteBtn.addEventListener("click", () => {{
+                const a = audios();
+                if (!a.length) return;
+                const nowMuted = !a[0].muted;
+                a.forEach(x => {{ x.muted = nowMuted; }});
+                muteBtn.classList.toggle("pv-on", nowMuted);
+                muteBtn.textContent = nowMuted ? "🔇 Muted" : "🔊 Mute";
+              }});
+
+              // Playback can also start/stop from the Waveforms panel's own
+              // per-track buttons, or a clip simply finishing — poll so this
+              // button's label stays honest regardless of what drove it.
+              setInterval(() => {{
+                positionFooter();
+                const playing = audios().some(x => !x.paused);
+                playBtn.classList.toggle("pv-on", playing);
+                playBtn.textContent = playing ? "❚❚ Pause" : "▶ Play";
+              }}, 300);
+            }}
+
+            const stats = {json.dumps(_footer_stats)};
+            const summary = doc.getElementById("pv-footer-summary");
+            if (summary) {{
+              summary.innerHTML = stats.map(s => '<span class="pv-footer-chip">' + s + '</span>').join("");
+            }}
+          }})();
+        </script>
+        """,
+        height=0,
+    )
+
+    st.markdown('<div id="pv-results-anchor"></div>', unsafe_allow_html=True)
+
+    # Scroll the results section into view, but only once per new result —
+    # a later rerun that doesn't touch _RESULT_RUN_ID_KEY (e.g. the Generate
+    # Spectrograms click) leaves run_id unchanged, so it's a no-op.
+    _run_id = st.session_state.get(_RESULT_RUN_ID_KEY, 0)
+    if _run_id and st.session_state.get(_SCROLLED_RUN_ID_KEY) != _run_id:
+        st.session_state[_SCROLLED_RUN_ID_KEY] = _run_id
+        components.html(
+            """
+            <script>
+              const doc = window.parent.document;
+              const el = doc.getElementById("pv-results-anchor");
+              if (el) {
+                el.scrollIntoView({behavior: "smooth", block: "start"});
+              }
+            </script>
+            """,
+            height=0,
+        )
+
+    # Clips in display order — (title, waveform title, samples, color). The
+    # waveform panel, its hidden players and the spectrograms all use this
+    # same order.
+    processed_title = f"Processed — {results.mode}"
+    clips = [
+        ("Original", "Original", results.original, COLOR_ORIGINAL),
+        (processed_title, processed_title, results.output, COLOR_PROCESSED),
+    ]
+    if results.naive is not None:
+        clips.append((
+            "Naive resample",
+            "Naive resample (pitch shifts too — no phase correction)",
+            results.naive,
+            COLOR_NAIVE,
+        ))
+
+    st.markdown('<div class="pv-section-title" id="waveforms">Waveforms</div>', unsafe_allow_html=True)
+    render_legend([(title, color) for title, _, _, color in clips])
+    render_waveform_group([(wave_title, clip, sr, color) for _, wave_title, clip, color in clips])
+
+    st.markdown('<div class="pv-section-title" id="spectrograms">Spectrograms</div>', unsafe_allow_html=True)
+    if st.session_state.get(SHOW_SPECTROGRAMS_KEY):
+        with st.spinner("Computing spectrograms..."):
+            render_spectrogram_group(
+                [(title, clip, sr) for title, _, clip, _ in clips],
+                settings.frame_size,
+                settings.hop_size,
+            )
+    else:
+        with st.container(key="pv_spectro_placeholder"):
+            st.markdown("Click **Generate Spectrograms** in the sidebar to compute them.")
+
+    render_players([clip for _, _, clip, _ in clips], sr)
+
+else:
+    if settings.audio_path is None:
+        st.info("Choose a sample track, upload a file, or record from your microphone to get started.")
+    else:
+        st.info("Click **Process Audio** in the sidebar to run the phase vocoder.")
+
+    st.markdown('<div class="pv-section-title">How it works</div>', unsafe_allow_html=True)
+    st.markdown(
+        """
+1. **Pick an audio source** — the built-in sample track, a file upload, or a microphone recording.
+2. **Set the vocoder parameters** — speed factor and/or pitch shift (in semitones), and a mode:
+   *Fast* (cheap, capped at a few semitones) or *Accurate* (resamples then time-stretches, wider range).
+3. **Click Process Audio.** The result appears here as waveforms you can play, plus metrics like
+   output duration and pitch shift.
+4. **Optionally click Generate Spectrograms** to see a magnitude spectrogram (dB, magma colormap)
+   of each clip, computed at the current engine settings.
+
+Turn on **naive-resample comparison** in the sidebar to see what happens *without* the phase
+vocoder — plain resampling changes pitch along with speed, which the vocoder avoids.
+        """
+    )
