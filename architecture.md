@@ -13,11 +13,17 @@ docstrings in `vocoder_processor.py` / `stft_processor.py` /
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                      UI Layer (app.py)                   │
-│   Streamlit widgets, plotting, audio players.             │
-│   Talks ONLY to VocoderOrchestrator + AudioLoader for     │
-│   metrics/display — never to Resampler or STFTProcessor   │
-│   directly.                                                │
+│                      UI Layer                             │
+│   app.py            page composition                      │
+│   sidebar.py        controls -> Settings                  │
+│   processing.py     one Process request -> ProcessingResult│
+│   waveform_panel.py / spectrogram_panel.py / panel_common.py│
+│                     result panels (browser-drawn)          │
+│   Processing goes ONLY through VocoderOrchestrator +       │
+│   AudioLoader (processing.py) — never Resampler or         │
+│   vocoder_processor directly. The one exception:           │
+│   spectrogram_panel.py runs its own display-only STFT      │
+│   via STFTProcessor to draw spectrograms.                  │
 └───────────────────────────┬────────────────────────────────┘
                               │
 ┌───────────────────────────▼────────────────────────────────┐
@@ -76,7 +82,12 @@ docstrings in `vocoder_processor.py` / `stft_processor.py` /
 | `STFTProcessor`           | STFT / ISTFT (windowing, overlap-add)                          | Which pipeline runs, phase-vocoder policy      |
 | `vocoder_processor`       | STFT + phase-vocoder phase tracking -> reconstructed audio     | Which pipeline to run; disk output             |
 | `VocoderOrchestrator`     | Choose/compose the pipeline (fast vs. accurate vs. naive); persist accurate-mode results to disk | Low-level interpolation/STFT/phase math |
-| `app.py`                  | Streamlit UI: inputs, dispatch to the orchestrator, rendering  | Any DSP; any file writing                      |
+| `app.py`                  | Compose the page: header, sidebar -> processing -> results layout | Any DSP; any file writing; widget details   |
+| `sidebar.py`              | Draw every control; return one `Settings`; save uploads/recordings to temp files | Processing; results display     |
+| `processing.py`           | Run one Process request through the orchestrator; naive clip; identity SNR -> `ProcessingResult` | Any Streamlit UI; DSP math |
+| `waveform_panel.py`       | Waveforms panel: envelope data, cursor, playback (drives hidden `st.audio` players), view controls | Processing   |
+| `spectrogram_panel.py`    | Spectrograms panel: display STFT -> dB -> pooled JPEG, axes, view controls | Processing                      |
+| `panel_common.py`         | What both panels share: layout constants, CSS, `PVPanel` JS, `render_panel()` | Panel-specific content          |
 
 ## 3. Why the refactor: separating processing from orchestration
 
@@ -147,11 +158,12 @@ Per-run behavior:
   writes to disk. It's a diagnostic/demo clip, not the orchestration
   recipe from `orchastration.md`.
 
-## 4. `app.py` changes
+## 4. UI-side dispatch (`processing.py`)
 
-`app.py` no longer imports or instantiates `vocoder_processor` directly.
-It constructs one `VocoderOrchestrator(loader, stft_processor)` per run
-and dispatches on the existing Fast/Accurate toggle exactly as before:
+The UI no longer imports or instantiates `vocoder_processor` directly.
+`processing.run_processing()` (called by `app.py`; originally inline in
+`app.py`) constructs one `VocoderOrchestrator(loader, stft_processor)` per
+run and dispatches on the existing Fast/Accurate toggle exactly as before:
 
 ```python
 orchestrator = VocoderOrchestrator(loader, stft_processor)
@@ -173,7 +185,31 @@ rendering, and section ordering are all untouched — this refactor is
 confined to *which object* the UI calls into for processing, not what the
 UI shows or how the math works.
 
-## 5. File structure
+## 5. UI layer split
+
+`app.py` used to hold the whole UI (~1,500 lines). It is now split by
+responsibility, with no change in behavior:
+
+```
+app.py
+ ├─ sidebar.render_sidebar()            -> Settings
+ ├─ processing.run_processing(...)      -> ProcessingResult   (stored in session_state)
+ └─ results layout
+     ├─ waveform_panel.render_legend()
+     ├─ waveform_panel.render_waveform_group()   ┐
+     ├─ spectrogram_panel.render_spectrogram_group() ┤ both via panel_common.render_panel()
+     └─ waveform_panel.render_players()   (hidden st.audio players the waveform panel drives)
+```
+
+The two result panels are drawn in the browser (each in its own
+`st.iframe`) so their View controls, cursor and playback respond without a
+Streamlit rerun. Their JavaScript and CSS live as raw strings in the panel
+modules (`WAVEFORM_JS`, `SPECTROGRAM_JS`, `SPECTROGRAM_CSS`) and in
+`panel_common.py` (`PANEL_CSS`, and `PANEL_COMMON_JS` — the `PVPanel`
+helper both panel scripts share). See `MODULES.md` for what each module,
+class and function does.
+
+## 6. File structure
 
 ```
 audio_loader.py          AudioLoader        — audio data + audio I/O (incl. unload(output_path=None))
@@ -181,5 +217,10 @@ lanczos_resampler.py     Resampler          — Lanczos interpolation / resampli
 stft_processor.py        STFTProcessor      — STFT / ISTFT
 vocoder_processor.py     vocoder_processor  — phase-vocoder transformation (fast path + resample passthrough)
 vocoder_orchestrator.py  VocoderOrchestrator — workflow: choose/compose pipeline, persist accurate-mode output
-app.py                   Streamlit UI — dispatches to VocoderOrchestrator
+app.py                   Streamlit entry point — composes the page
+sidebar.py               Settings, render_sidebar() — all controls
+processing.py            ProcessingResult, run_processing() — dispatches to VocoderOrchestrator
+panel_common.py          shared panel CSS / PVPanel JS / render_panel()
+waveform_panel.py        Waveforms panel + hidden audio players
+spectrogram_panel.py     Spectrograms panel
 ```

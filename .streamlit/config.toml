@@ -1,0 +1,11 @@
+# Page theme — mirrors the dark palette already used by the result panels
+# and the sidebar (see panel_common.py's COLOR_* constants), so the main
+# content area (metrics, headings, legend) no longer sits on Streamlit's
+# default light theme while everything around it is dark.
+[theme]
+base = "dark"
+primaryColor = "#ef4444"
+backgroundColor = "#0b0f14"
+secondaryBackgroundColor = "#111827"
+textColor = "#e5e7eb"
+font = "sans serif"
