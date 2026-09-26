@@ -105,6 +105,95 @@ class vocoder_processor:
 
         return wk_hat
 
+    def compute_spectral_flux(self) -> np.ndarray:
+        """
+        Per-frame spectral energy flux, used to detect transients (onsets):
+
+            F_t = sum_k max(0, |X_t(k)| - |X_(t-1)(k)|)
+
+        Only the *increase* in magnitude counts (rectified via max(0, ..)) —
+        a sudden rise in energy is what marks an attack/transient, a decay
+        doesn't need a phase reset.
+
+        Returns
+        -------
+        flux : np.ndarray
+            1-D array of shape (num_frames,). flux[0] is defined as 0.0
+            since there is no previous frame to compare frame 0 against.
+        """
+        if self.stft_matrix is None:
+            self.run_stft()
+        if self.stft_matrix is None:
+            raise RuntimeError("run_stft returned none")
+
+        magnitude = np.abs(self.stft_matrix)
+        rise = np.maximum(0.0, magnitude[:, 1:] - magnitude[:, :-1])
+        flux = np.sum(rise, axis=0)
+
+        # No previous frame for frame 0 -> flux undefined / can't be a transient.
+        return np.concatenate(([0.0], flux))
+
+    def detect_transients(self) -> np.ndarray:
+        """
+        Flag transient (onset) frames from the spectral flux using an
+        adaptive threshold: frame t is a transient if
+
+            F_t > mu_F + 2 * sigma_F
+
+        where mu_F and sigma_F are the mean and standard deviation of the
+        flux over the *preceding* ~250ms of frames (frame t itself is
+        excluded from its own statistics, otherwise a spike would inflate
+        the very threshold it needs to beat).
+
+        A last-transient tracker enforces a ~20ms refractory period after
+        each accepted transient so the same attack (whose flux often stays
+        elevated for more than one frame) isn't re-triggered on every
+        frame it spans.
+
+        Returns
+        -------
+        is_transient : np.ndarray
+            1-D boolean array of shape (num_frames,).
+        """
+        flux = self.compute_spectral_flux()
+        num_frames = len(flux)
+
+        sample_rate = self.audio_loader.sample_rate
+        if sample_rate is None:
+            raise RuntimeError("Sample rate unavailable.")
+        Ha = self.stft_processor.hop_size
+
+        # ~250ms of analysis frames for the running mean/std, ~20ms for the
+        # refractory period — both in frame counts (at least 1 frame each,
+        # so this still behaves sensibly at very large hop sizes).
+        stats_window_frames = max(1, round(0.25 * sample_rate / Ha))
+        refractory_frames = max(1, round(0.02 * sample_rate / Ha))
+
+        is_transient = np.zeros(num_frames, dtype=bool)
+
+        # Tracks the frame index of the last accepted transient so a single
+        # attack's elevated flux doesn't immediately re-trigger on the next
+        # frame(s) within the refractory window.
+        last_transient_frame = -refractory_frames
+
+        for t in range(num_frames):
+            history = flux[max(0, t - stats_window_frames):t]
+            if len(history) < stats_window_frames:
+                # Not enough history yet for a stable mean/std (start of the
+                # clip) -- with only 1-2 samples, sigma can be ~0 and any
+                # nonzero flux would trivially "beat" the threshold.
+                continue
+
+            mu = np.mean(history)
+            sigma = np.std(history)
+
+            past_refractory = (t - last_transient_frame) >= refractory_frames
+            if flux[t] > mu + 2 * sigma and past_refractory:
+                is_transient[t] = True
+                last_transient_frame = t
+
+        return is_transient
+
     def calculate_shi_out(self, speed_factor:float = 1, pitch_factor:float = 1):
 
         Hs = self.get_synthesis_hop(speed_factor)
@@ -115,6 +204,13 @@ class vocoder_processor:
         if(self.stft_matrix is None):
             raise RuntimeError("STFT went wrong")
 
+        # Frames flagged as transients get their synthesis phase reset to
+        # the analysis phase directly, instead of accumulated from the
+        # previous frame. Accumulating straight through an attack smears
+        # its energy across the (now differently-spaced) surrounding
+        # frames, which is heard as a soft/blurred transient in the output.
+        is_transient = self.detect_transients()
+
         shi_out = np.zeros_like(self.stft_matrix, dtype=float)
         # Only the first column's phase is actually used below, so take the
         # angle of that one column instead of np.angle() over the whole
@@ -122,7 +218,10 @@ class vocoder_processor:
         # full-size computation once; no need to redo it here for one column.
         shi_out[:,0] = np.angle(self.stft_matrix[:, 0])
         for frame in range(1, shi_out.shape[1]):
-            shi_out[:, frame] = shi_out[:, frame-1] + wk_hat[:, frame]*Hs
+            if is_transient[frame]:
+                shi_out[:, frame] = np.angle(self.stft_matrix[:, frame])
+            else:
+                shi_out[:, frame] = shi_out[:, frame-1] + wk_hat[:, frame]*Hs
 
         return shi_out
 
@@ -154,4 +253,3 @@ class vocoder_processor:
         
         resampler = Resampler(self.audio_loader, duration_factor)
         return resampler.get_resampled_audio()
-
