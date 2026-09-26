@@ -135,6 +135,29 @@ SIDEBAR_CSS = Template(r"""
   [data-testid="stSidebar"] [data-testid="stButton"] button:disabled {
     opacity: 0.4; cursor: not-allowed;
   }
+  /* st.audio_input's own waveform-preview decode occasionally fails right
+     after you stop recording and shows a red "An error has occurred,
+     please try again" banner — even though the recording itself already
+     uploaded fine (that upload and this preview decode are two separate
+     operations inside the widget; only the preview is broken). Hidden
+     here since it's needlessly alarming and not something we can fix —
+     it's inside Streamlit's own component. Targets Streamlit's internal
+     (unstable) emotion class for that banner, so it may need updating
+     after a Streamlit upgrade if the banner starts showing again — the
+     caption in _audio_source() below is the fallback for that case.
+  */
+  [data-testid="stSidebar"] [data-testid="stAudioInput"] .e1ywdc2n5 {
+    display: none !important;
+  }
+  /* "Recording captured." (the caption right after the recorder in
+     _audio_source()) reflects the *previous* take — Streamlit doesn't
+     tell our Python code a new recording has started until it finishes,
+     so we can't clear it from script logic. Hide it purely on the
+     frontend instead, keyed off the recorder's own "Stop recording"
+     button, which only has that aria-label while actively recording. */
+  .st-key-pv_sb_audio:has([aria-label="Stop recording"]) [data-testid="stCaptionContainer"] {
+    display: none !important;
+  }
 </style>
 """).substitute(
     bg=COLOR_BG,

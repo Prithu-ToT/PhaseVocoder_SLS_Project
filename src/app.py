@@ -241,54 +241,78 @@ if results is not None:
             }}
             positionFooter();
 
+            // Query the buttons and (re)bind their onclick every run, even
+            // though the footer div itself is only created once — this is
+            // a fresh <iframe> (and fresh JS closures) each rerun, so if
+            // anything about the previous run's closures went stale (e.g.
+            // the iframe embedding them got torn down), the buttons would
+            // otherwise silently stop responding on the run after the
+            // first. `.onclick =` (not addEventListener) is what makes
+            // re-running this safe — it replaces rather than stacks.
+            const audios = () => Array.from(doc.querySelectorAll(".st-key-pv_players audio"));
+            const waveBtn = footer.querySelector("#pv-footer-wave");
+            const specBtn = footer.querySelector("#pv-footer-spec");
+            const playBtn = footer.querySelector("#pv-footer-play");
+            const muteBtn = footer.querySelector("#pv-footer-mute");
+
+            const scrollToSection = id => {{
+              const el = doc.getElementById(id);
+              if (el) el.scrollIntoView({{ behavior: "smooth", block: "start" }});
+            }};
+            waveBtn.onclick = () => scrollToSection("waveforms");
+            specBtn.onclick = () => scrollToSection("spectrograms");
+
+            playBtn.onclick = () => {{
+              const a = audios();
+              if (!a.length) return;
+              const playing = a.find(x => !x.paused);
+              if (playing) {{
+                playing.pause();
+              }} else {{
+                const next = a.find(x => x.currentTime > 0) || a[0];
+                const p = next.play();
+                if (p && p.catch) p.catch(() => {{}});
+              }}
+            }};
+
+            muteBtn.onclick = () => {{
+              const a = audios();
+              if (!a.length) return;
+              const nowMuted = !a[0].muted;
+              a.forEach(x => {{ x.muted = nowMuted; }});
+              muteBtn.classList.toggle("pv-on", nowMuted);
+              muteBtn.textContent = nowMuted ? "🔇 Muted" : "🔊 Mute";
+            }};
+
             if (isNewFooter) {{
+              // Registered on the persistent parent window (doc.defaultView
+              // is window.parent, not this iframe's own window), so unlike
+              // the interval below it survives future reruns fine and only
+              // needs doing once.
               doc.defaultView.addEventListener("resize", positionFooter);
-
-              const audios = () => Array.from(doc.querySelectorAll(".st-key-pv_players audio"));
-              const waveBtn = footer.querySelector("#pv-footer-wave");
-              const specBtn = footer.querySelector("#pv-footer-spec");
-              const playBtn = footer.querySelector("#pv-footer-play");
-              const muteBtn = footer.querySelector("#pv-footer-mute");
-
-              const scrollToSection = id => {{
-                const el = doc.getElementById(id);
-                if (el) el.scrollIntoView({{ behavior: "smooth", block: "start" }});
-              }};
-              waveBtn.addEventListener("click", () => scrollToSection("waveforms"));
-              specBtn.addEventListener("click", () => scrollToSection("spectrograms"));
-
-              playBtn.addEventListener("click", () => {{
-                const a = audios();
-                if (!a.length) return;
-                const playing = a.find(x => !x.paused);
-                if (playing) {{
-                  playing.pause();
-                }} else {{
-                  const next = a.find(x => x.currentTime > 0) || a[0];
-                  const p = next.play();
-                  if (p && p.catch) p.catch(() => {{}});
-                }}
-              }});
-
-              muteBtn.addEventListener("click", () => {{
-                const a = audios();
-                if (!a.length) return;
-                const nowMuted = !a[0].muted;
-                a.forEach(x => {{ x.muted = nowMuted; }});
-                muteBtn.classList.toggle("pv-on", nowMuted);
-                muteBtn.textContent = nowMuted ? "🔇 Muted" : "🔊 Mute";
-              }});
-
-              // Playback can also start/stop from the Waveforms panel's own
-              // per-track buttons, or a clip simply finishing — poll so this
-              // button's label stays honest regardless of what drove it.
-              setInterval(() => {{
-                positionFooter();
-                const playing = audios().some(x => !x.paused);
-                playBtn.classList.toggle("pv-on", playing);
-                playBtn.textContent = playing ? "❚❚ Pause" : "▶ Play";
-              }}, 300);
             }}
+
+            // Playback can also start/stop from the Waveforms panel's own
+            // per-track buttons, or a clip simply finishing — poll so this
+            // button's label stays honest regardless of what drove it.
+            // Started fresh every rerun, unlike the resize listener above:
+            // this script runs inside an <iframe> whose content (the footer
+            // stats text) changes every rerun, so the iframe actually
+            // reloads each time — which silently cancels any setInterval
+            // timer it registered, since timers belong to the iframe's own
+            // window, not the parent's. Guarding this with isNewFooter (as
+            // the resize listener is) meant it only ever ran until the
+            // first reload, after which the Play button's label/state
+            // simply stopped updating even though clicking it still worked
+            // (the onclick handlers above are safe because they're plain
+            // properties on the parent document's persistent DOM nodes,
+            // not timers owned by this iframe).
+            setInterval(() => {{
+              positionFooter();
+              const playing = audios().some(x => !x.paused);
+              playBtn.classList.toggle("pv-on", playing);
+              playBtn.textContent = playing ? "❚❚ Pause" : "▶ Play";
+            }}, 300);
 
             const stats = {json.dumps(_footer_stats)};
             const summary = doc.getElementById("pv-footer-summary");
